@@ -1,0 +1,1966 @@
+"""
+main.py - padne PDN 分析 HTTP 服务端
+接收 SerializedProblem JSON，反序列化为 problem.Problem（含 Shapely 几何），
+调用 FEM solver 求解，返回 SerializedSolution JSON + matplotlib 可视化图片。
+"""
+
+import base64
+import gc
+import io
+import logging
+import os
+import threading
+import warnings
+from typing import Any
+
+import numpy as np
+import scipy.sparse
+import scipy.sparse.linalg
+import shapely.geometry
+import shapely.ops
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+try:
+    from . import problem, solver, mesh_pure as mesh
+except ImportError:
+    import problem
+    import solver
+    import mesh_pure as mesh
+
+log = logging.getLogger(__name__)
+
+# ============================================================
+# 内存保护配置
+# ============================================================
+
+MAX_SYSTEM_SIZE = 50000       # 系统矩阵最大维度 N (N×N)
+MAX_GEOM_VERTICES = 80000    # 几何边界顶点估算上限（预检用）
+SOLVE_TIMEOUT_SEC = 120      # 求解超时（秒）
+MAX_MEMORY_MB = 2048         # 进程最大允许内存 (MB)
+
+
+def _estimate_geometry_vertices(prob) -> int:
+    """估算所有层的几何边界顶点总数（用于求解前预检）"""
+    total = 0
+    for layer in prob.layers:
+        for geom in layer.geoms:
+            total += len(geom.exterior.coords)
+            for interior in geom.interiors:
+                total += len(interior.coords)
+    return total
+
+
+def _get_memory_mb() -> float | None:
+    """获取当前进程 RSS 内存 (MB)，psutil 不可用时返回 None"""
+    if not _HAS_PSUTIL:
+        return None
+    try:
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def _check_memory(label: str) -> None:
+    """检查内存使用，超限则抛出 MemoryError"""
+    mem = _get_memory_mb()
+    if mem is not None:
+        if mem > MAX_MEMORY_MB:
+            raise MemoryError(f"[{label}] 内存超限: {mem:.0f} MB > {MAX_MEMORY_MB} MB")
+        log.info(f"[{label}] 内存: {mem:.0f} MB")
+
+
+def _solve_with_timeout(solve_fn, *args):
+    """在独立线程中运行求解函数，超时则报错（线程可能继续在后台运行）"""
+    result = [None]
+    error = [None]
+
+    def worker():
+        try:
+            result[0] = solve_fn(*args)
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout=SOLVE_TIMEOUT_SEC)
+
+    if t.is_alive():
+        raise TimeoutError(f"求解超时 ({SOLVE_TIMEOUT_SEC}s)，请简化 PCB 数据后重试")
+
+    if error[0] is not None:
+        raise error[0]
+
+    return result[0]
+
+
+def _prune_bad_layers(prob: problem.Problem, bad_layer_indices: set[int]) -> problem.Problem:
+    """Remove connections AND elements referencing bad layers to avoid singular matrices."""
+    if not bad_layer_indices:
+        return prob
+
+    new_networks = []
+    for network in prob.networks:
+        bad_conns = [c for c in network.connections
+                     if prob.layers.index(c.layer) in bad_layer_indices]
+        if not bad_conns:
+            new_networks.append(network)
+            continue
+
+        bad_nodes = {c.node_id for c in bad_conns}
+        good_conns = [c for c in network.connections
+                      if prob.layers.index(c.layer) not in bad_layer_indices]
+
+        # Remove elements whose terminals reference any bad node
+        good_elements = [e for e in network.elements
+                         if not any(t in bad_nodes for t in e.terminals)]
+
+        # Remove connections whose node_id is no longer in any remaining element
+        remaining_nodes = set()
+        for e in good_elements:
+            remaining_nodes.update(e.terminals)
+        valid_conns = [c for c in good_conns if c.node_id in remaining_nodes]
+
+        if valid_conns or good_elements:
+            new_networks.append(problem.Network(
+                connections=valid_conns,
+                elements=good_elements,
+            ))
+    log.info(f"修剪坏层连接+元件: {len(prob.networks)} -> {len(new_networks)} 网络, "
+             f"坏层={bad_layer_indices}")
+    return problem.Problem(
+        layers=prob.layers,
+        networks=new_networks,
+        project_name=prob.project_name,
+    )
+
+
+def _prune_no_mesh_layers(prob: problem.Problem) -> problem.Problem:
+    """Pre-check: remove connections and elements for layers with no valid geometry."""
+    has_geom = set()
+    for i, layer in enumerate(prob.layers):
+        if not layer.geoms or len(layer.geoms) == 0:
+            continue
+        for geom in layer.geoms:
+            if not geom.is_empty and geom.area > 1e-10:
+                has_geom.add(i)
+                break
+
+    if len(has_geom) == len(prob.layers):
+        return prob
+
+    bad_layers = set(range(len(prob.layers))) - has_geom
+    return _prune_bad_layers(prob, bad_layers)
+
+
+def _ensure_connection_geometry(prob: problem.Problem,
+                                diag: DiagnosticsCollector | None = None
+                                ) -> None:
+    """Expand layer geometry to cover connection points outside existing copper areas.
+
+    Distance-based strategy:
+    - dist < 0.5mm: in clearance hole, skip (via plating connects)
+    - 0.5mm <= dist <= 5mm: patch with bridge (nearby copper, reasonable to bridge)
+    - dist > 5mm: skip entirely (this layer has no copper here, connection handled by other layers)
+    """
+    if diag:
+        diag.section("0b. _ensure_connection_geometry 检查")
+
+    for layer_i, layer in enumerate(prob.layers):
+        if not layer.geoms:
+            if diag:
+                diag.add(f"  Layer {layer_i} '{layer.name}': 无几何体，跳过")
+            continue
+        layer_union = shapely.ops.unary_union(list(layer.geoms))
+        initial_geom_count = len(layer.geoms)
+
+        # 收集该层所有连接点及其距离
+        layer_conns = []
+        for network in prob.networks:
+            for conn in network.connections:
+                if prob.layers.index(conn.layer) == layer_i:
+                    dist = layer_union.distance(conn.point)
+                    layer_conns.append((conn, dist))
+
+        # 只桥接 0.5-5mm 范围内的点；>5mm 说明该层无铜皮，跳过
+        missing = [(conn, d) for conn, d in layer_conns if 0.5 < d <= 5.0]
+        skipped_far = [(conn, d) for conn, d in layer_conns if d > 5.0]
+
+        if diag:
+            diag.add(f"  Layer {layer_i} '{layer.name}': "
+                     f"初始 {initial_geom_count} 个几何体, "
+                     f"连接点 {len(layer_conns)} 个")
+            if layer_conns:
+                dists = [d for _, d in layer_conns]
+                dists.sort(reverse=True)
+                top_dists = [f"{d:.4f}" for d in dists[:10]]
+                diag.add(f"    距离铜皮最远的连接点: [{', '.join(top_dists)}"
+                         + (f" ... +{len(dists)-10}个]" if len(dists) > 10 else "]"))
+            diag.add(f"    0.5-5mm (桥接): {len(missing)} 个, "
+                     f">5mm (跳过): {len(skipped_far)} 个")
+
+        if skipped_far and diag:
+            for conn, d in skipped_far[:5]:
+                diag.add(f"    跳过远距点 ({conn.point.x:.3f}, {conn.point.y:.3f}) "
+                         f"@ {conn.layer.name} 距铜皮 {d:.1f}mm")
+            if len(skipped_far) > 5:
+                diag.add(f"    ... 还有 {len(skipped_far) - 5} 个远距点跳过")
+
+        if not missing:
+            continue
+
+        log.info(f"层{layer_i}({layer.name}): 发现 {len(missing)} 个连接点距铜皮 0.5-5mm，桥接中")
+        patches = []
+        tree = shapely.strtree.STRtree(layer.geoms)
+        for conn, dist in missing:
+            pt = conn.point
+            if diag:
+                diag.add(f"    桥接点 ({pt.x:.3f}, {pt.y:.3f}) 距铜皮 {dist:.4f}mm")
+            nearest_idx = tree.nearest(pt)
+            if nearest_idx is not None and nearest_idx < len(layer.geoms):
+                nearest_geom = layer.geoms[nearest_idx]
+                ndist = nearest_geom.distance(pt)
+                if 0 < ndist < 5.0:
+                    _, target = shapely.ops.nearest_points(pt, nearest_geom)
+                    line = shapely.geometry.LineString([(pt.x, pt.y), (target.x, target.y)])
+                    patches.append(line.buffer(0.1))
+                    patches.append(pt.buffer(0.15))
+                else:
+                    patches.append(pt.buffer(0.2))
+            else:
+                patches.append(pt.buffer(0.2))
+        new_shape = shapely.ops.unary_union([layer_union] + patches)
+        if isinstance(new_shape, shapely.geometry.Polygon):
+            new_shape = shapely.geometry.MultiPolygon([new_shape])
+        object.__setattr__(layer, 'shape', new_shape)
+        object.__setattr__(layer, 'geoms', tuple(new_shape.geoms))
+        final_count = len(new_shape.geoms)
+        log.info(f"层{layer_i}({layer.name}): 桥接{len(missing)}个连接点, "
+                 f"初始{initial_geom_count}个几何 → 结果 {final_count} 个几何体")
+        if diag:
+            diag.add(f"    结果: {initial_geom_count} → {final_count} 个几何体"
+                     + (" !! 碎片化!" if final_count > initial_geom_count else ""))
+
+
+def _prune_far_connections(prob: problem.Problem, max_distance: float = 5.0,
+                           diag: DiagnosticsCollector | None = None) -> problem.Problem:
+    """Remove connections >max_distance from copper on their layer, plus associated elements.
+
+    When a via's connection point on a layer is very far from copper (>5mm),
+    it means that layer has no copper at that location. The via doesn't connect
+    to that layer electrically. Removing these invalid connections prevents
+    the solver from creating incorrect node mappings that cause matrix singularity.
+    """
+    if diag:
+        diag.section("0c. 远距离连接修剪 (>" + str(max_distance) + "mm)")
+
+    bad_nodes: set[problem.NodeID] = set()
+    for layer_i, layer in enumerate(prob.layers):
+        if not layer.geoms:
+            continue
+        layer_union = shapely.ops.unary_union(list(layer.geoms))
+        for network in prob.networks:
+            for conn in network.connections:
+                if prob.layers.index(conn.layer) == layer_i:
+                    dist = layer_union.distance(conn.point)
+                    if dist > max_distance:
+                        bad_nodes.add(conn.node_id)
+
+    if not bad_nodes:
+        if diag:
+            diag.add("  无远距离连接，跳过")
+        return prob
+
+    if diag:
+        diag.add(f"  发现 {len(bad_nodes)} 个远距离节点需要移除")
+
+    new_networks = []
+    for ni, network in enumerate(prob.networks):
+        good_elements = [e for e in network.elements
+                         if not any(t in bad_nodes for t in e.terminals)]
+        good_conns = [c for c in network.connections if c.node_id not in bad_nodes]
+
+        remaining_nodes = set()
+        for e in good_elements:
+            remaining_nodes.update(e.terminals)
+        valid_conns = [c for c in good_conns if c.node_id in remaining_nodes]
+
+        removed_conns = len(network.connections) - len(valid_conns)
+        removed_elems = len(network.elements) - len(good_elements)
+
+        if diag:
+            diag.add(f"  Network {ni}: 移除 {removed_conns} 连接, "
+                     f"{removed_elems} 元件, "
+                     f"保留 {len(valid_conns)} 连接, {len(good_elements)} 元件")
+
+        if valid_conns or good_elements:
+            new_networks.append(problem.Network(
+                connections=valid_conns,
+                elements=good_elements,
+            ))
+
+    log.info(f"远距离连接修剪: {len(bad_nodes)} 个坏节点, "
+             f"{len(prob.networks)} → {len(new_networks)} 网络")
+
+    return problem.Problem(
+        layers=prob.layers,
+        networks=new_networks,
+        project_name=prob.project_name,
+    )
+
+
+def _check_connectivity(prob: problem.Problem) -> str:
+    """检查每个连接点是否落在铜皮内，返回诊断文本。"""
+    layer_by_name = {layer.name: layer for layer in prob.layers}
+    lines = ["=== 连通性诊断 ===\n"]
+
+    source_ok = 0
+    source_bad = 0
+    load_ok = 0
+    load_bad = 0
+    via_total = 0
+    via_in = 0
+
+    for network in prob.networks:
+        vs_terminals = set()
+        cs_terminals = set()
+        for elem in network.elements:
+            if isinstance(elem, problem.VoltageSource):
+                vs_terminals.add(elem.p)
+            elif isinstance(elem, problem.CurrentSource):
+                cs_terminals.add(elem.t)
+
+        for conn in network.connections:
+            layer = layer_by_name.get(conn.layer.name)
+            if not layer or not layer.geoms:
+                status = 'NO_LAYER'
+                detail = '该层无铜皮'
+            else:
+                hits = [g for g in layer.geoms if g.intersects(conn.point)]
+                if hits:
+                    status = 'OK'
+                    detail = '在铜皮内'
+                else:
+                    dists = [g.distance(conn.point) for g in layer.geoms]
+                    min_dist = min(dists) if dists else float('inf')
+                    status = 'MISS'
+                    detail = f'不在铜皮内(距最近铜皮{min_dist:.3f}mm)'
+
+            is_source = conn.node_id in vs_terminals
+            is_load = conn.node_id in cs_terminals
+
+            if is_source:
+                mark = 'OK' if status == 'OK' else '!!'
+                lines.append(f"  源 [{mark}] ({conn.point.x:.2f}, {conn.point.y:.2f}) {conn.layer.name}: {detail}")
+                if status == 'OK':
+                    source_ok += 1
+                else:
+                    source_bad += 1
+            elif is_load:
+                mark = 'OK' if status == 'OK' else '!!'
+                lines.append(f"  载 [{mark}] ({conn.point.x:.2f}, {conn.point.y:.2f}) {conn.layer.name}: {detail}")
+                if status == 'OK':
+                    load_ok += 1
+                else:
+                    load_bad += 1
+            else:
+                via_total += 1
+                if status == 'OK':
+                    via_in += 1
+
+    lines.append(f"\n  源焊盘: {source_ok} OK / {source_bad} 未连通")
+    lines.append(f"  负载焊盘: {load_ok} OK / {load_bad} 未连通")
+    lines.append(f"  过孔: {via_in}/{via_total} 在铜皮内")
+
+    if source_bad > 0:
+        lines.append(f"\n  !! {source_bad} 个源焊盘不在铜皮内，电压源无法正常供电！")
+    if load_bad > 0:
+        lines.append(f"  !! {load_bad} 个负载焊盘不在铜皮内，负载电流无法注入！")
+
+    text = '\n'.join(lines)
+    log.info(text)
+    return text
+
+
+def _build_partial_solution(prob: problem.Problem) -> solver.Solution:
+    """Build a solution with meshes only (no FEM results) for visualization when solver fails."""
+    mesher_instance = mesh.Mesher()
+    layer_solutions = []
+    for layer in prob.layers:
+        meshes_list = []
+        potentials = []
+        power_densities = []
+        for geom in layer.geoms:
+            try:
+                m = mesher_instance.poly_to_mesh(geom)
+                if len(m.vertices) > 0:
+                    meshes_list.append(m)
+                    potentials.append(mesh.ZeroForm(m))
+                    power_densities.append(mesh.TwoForm(m))
+            except Exception:
+                continue
+        layer_solutions.append(solver.LayerSolution(
+            meshes=meshes_list,
+            potentials=potentials,
+            power_densities=power_densities,
+        ))
+    return solver.Solution(
+        problem=prob,
+        layer_solutions=layer_solutions,
+        solver_info=solver.SolverInfo(ground_node_current=0.0, residual_norm=0.0),
+    )
+
+
+def _find_solver_disconnected_layers(prob: problem.Problem) -> set[int]:
+    """Use solver's own connectivity analysis to find layers that won't get a KDTree."""
+    try:
+        strtrees = solver.construct_strtrees_from_layers(prob.layers)
+        cg = solver.ConnectivityGraph.create_from_problem(prob, strtrees)
+        connected_pairs = solver.find_connected_layer_geom_indices(cg)
+        connected_layers = {li for li, _ in connected_pairs}
+        return set(range(len(prob.layers))) - connected_layers
+    except Exception:
+        return set()
+
+# matplotlib 可选依赖
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.tri as mtri
+    from mpl_toolkits.mplot3d import Axes3D
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    log.warning("matplotlib 未安装，可视化功能不可用")
+
+
+# ============================================================
+# 请求/响应模型
+# ============================================================
+
+class AnalyzeRequest(BaseModel):
+    """SerializedProblem JSON 格式"""
+    format_version: int = 1
+    project_name: str | None = None
+    layers: list[dict]
+    networks: list[dict]
+    generate_images: bool = False
+
+
+class MeshTriangleOutput(BaseModel):
+    vertices: list[int]
+
+
+class MeshOutput(BaseModel):
+    vertices: list[list[float]]
+    triangles: list[MeshTriangleOutput]
+    potentials: list[float]
+    power_densities: list[float]
+
+
+class DisconnectedMeshOutput(BaseModel):
+    vertices: list[list[float]]
+    triangles: list[MeshTriangleOutput]
+
+
+class LayerSolutionOutput(BaseModel):
+    layer_name: str
+    meshes: list[MeshOutput]
+    disconnected_meshes: list[DisconnectedMeshOutput]
+
+
+class SolverInfoOutput(BaseModel):
+    ground_node_current: float
+    residual_norm: float
+
+
+class AnalyzeResponse(BaseModel):
+    success: bool
+    message: str | None = None
+    layer_solutions: list[LayerSolutionOutput] = []
+    solver_info: SolverInfoOutput | None = None
+    images: dict | None = None
+    connection_points: dict[str, list[dict]] = {}
+    layer_boundaries: dict[str, list[dict]] = {}
+    diagnostics: list[str] = []
+
+
+# ============================================================
+# 反序列化：JSON → problem.Problem
+# ============================================================
+
+def _clean_ring(coords: list, min_dist: float = 0.02) -> list:
+    """清理多边形环：去除重复点、过近点，确保最小边长"""
+    if len(coords) < 3:
+        return coords
+    cleaned = [coords[0]]
+    for i in range(1, len(coords)):
+        x1, y1 = cleaned[-1]
+        x2, y2 = coords[i]
+        dx, dy = x2 - x1, y2 - y1
+        if dx * dx + dy * dy >= min_dist * min_dist:
+            cleaned.append(coords[i])
+    # 检查首尾是否过近
+    if len(cleaned) >= 4:
+        x1, y1 = cleaned[-1]
+        x2, y2 = cleaned[0]
+        dx, dy = x2 - x1, y2 - y1
+        if dx * dx + dy * dy < min_dist * min_dist:
+            cleaned.pop()
+    return cleaned if len(cleaned) >= 3 else []
+
+
+def deserialize_geometry(geometry: list, skip_union: bool = False) -> shapely.geometry.MultiPolygon:
+    """将 SerializedMultiPolygon 转为 Shapely MultiPolygon，清理几何。
+
+    注意：始终使用 unary_union 合并重叠/相邻多边形，
+    确保同一层上的连续铜皮是一个几何体，避免 FEM 网格断裂。
+    使用微小 buffer 确保相邻（但非重叠）的碎片也能合并。
+    """
+    polygons = []
+    for poly_data in geometry:
+        if not poly_data or len(poly_data) == 0:
+            continue
+        exterior = _clean_ring([(p[0], p[1]) for p in poly_data[0]])
+        if len(exterior) < 3:
+            continue
+        holes = []
+        for hole_data in poly_data[1:]:
+            hr = _clean_ring([(p[0], p[1]) for p in hole_data])
+            if len(hr) >= 3:
+                holes.append(hr)
+        try:
+            poly = shapely.geometry.Polygon(exterior, holes)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty and poly.area > 0.01:
+                polygons.append(poly)
+        except Exception as e:
+            log.warning(f"跳过无效多边形: {e}")
+
+    # flatten: buffer(0) may produce MultiPolygon from invalid polygons
+    flat = []
+    for p in polygons:
+        if isinstance(p, shapely.geometry.MultiPolygon):
+            flat.extend(g for g in p.geoms if isinstance(g, shapely.geometry.Polygon))
+        else:
+            flat.append(p)
+    polygons = flat
+
+    if not polygons:
+        return shapely.geometry.MultiPolygon()
+
+    # 微小 buffer 让相邻碎片重叠，确保 unary_union 能合并
+    merge_gap = 0.01  # mm，足够合并间隙但不影响实际尺寸
+    buffered = [p.buffer(merge_gap) for p in polygons]
+    merged = shapely.ops.unary_union(buffered)
+    # 减回 buffer，恢复实际尺寸
+    merged = merged.buffer(-merge_gap)
+    # 清理
+    merged = merged.buffer(0)
+
+    result_polys = []
+    geoms = merged.geoms if isinstance(merged, shapely.geometry.MultiPolygon) else [merged]
+    for p in geoms:
+        if not isinstance(p, shapely.geometry.Polygon) or p.area < 0.01:
+            continue
+        # 对每个多边形的环再做一次清理
+        ext = _clean_ring(list(p.exterior.coords), 0.02)
+        if len(ext) < 3:
+            continue
+        hol = []
+        for interior in p.interiors:
+            hr = _clean_ring(list(interior.coords), 0.02)
+            if len(hr) >= 3:
+                hol.append(hr)
+        cleaned = shapely.geometry.Polygon(ext, hol)
+        if cleaned.is_valid and not cleaned.is_empty:
+            result_polys.append(cleaned)
+
+    return shapely.geometry.MultiPolygon(result_polys) if result_polys else shapely.geometry.MultiPolygon()
+
+
+def deserialize_problem(data: AnalyzeRequest,
+                       diag: DiagnosticsCollector | None = None
+                       ) -> tuple[problem.Problem, dict | None]:
+    """将 SerializedProblem JSON 反序列化为 problem.Problem。
+
+    Returns:
+        (Problem, pre_meshed_data or None)
+        pre_meshed_data: dict[(layer_i, geom_i)] → {"vertices": [...], "triangles": [...]} when format_version=2
+    """
+    has_pre_meshed = data.format_version == 2
+    pre_meshed_data: dict[tuple[int, int], dict] | None = {} if has_pre_meshed else None
+
+    layers = []
+    if diag:
+        diag.section("0. 几何合并 (铺铜+走线 → 层几何)")
+    for layer_i, layer_data in enumerate(data.layers):
+        n_input_polys = len(layer_data["geometry"])
+        total_input_verts = sum(len(p[0]) for p in layer_data["geometry"] if p)
+        shape = deserialize_geometry(layer_data["geometry"])
+        n_merged_geoms = len(shape.geoms)
+        log.info(f"层 {layer_i} '{layer_data['name']}': "
+                 f"输入 {n_input_polys} 个多边形 ({total_input_verts} 顶点) → "
+                 f"合并后 {n_merged_geoms} 个几何体")
+        if diag:
+            diag.add(f"  Layer {layer_i} '{layer_data['name']}': "
+                     f"输入 {n_input_polys} 个多边形 ({total_input_verts} 顶点) → "
+                     f"合并后 {n_merged_geoms} 个几何体")
+            if n_merged_geoms > 1:
+                areas = sorted([g.area for g in shape.geoms], reverse=True)
+                area_strs = [f"{a:.1f}" for a in areas[:10]]
+                diag.add(f"    面积(降序): [{', '.join(area_strs)}"
+                         + (f" ... +{len(areas)-10}个]" if len(areas) > 10 else "]"))
+                # 检测是否有面积很小的碎片（可能是间隙导致的未合并碎片）
+                tiny = sum(1 for a in areas if a < 1.0)
+                if tiny > 0:
+                    diag.add(f"    !! {tiny} 个面积 <1mm² 的微小碎片，可能是合并间隙导致")
+        layer = problem.Layer(
+            shape=shape,
+            name=layer_data["name"],
+            conductance=layer_data["conductance"],
+        )
+        layers.append(layer)
+
+        # 提取预网格数据（仅在合并后几何数量匹配时使用）
+        if has_pre_meshed and layer_data.get("meshes"):
+            n_original = len(layer_data["meshes"])
+            n_merged = len(shape.geoms)
+            if n_original == n_merged:
+                # 几何数量未变，可以使用预网格数据
+                for geom_i, mesh_data in enumerate(layer_data["meshes"]):
+                    if geom_i < n_merged:
+                        pre_meshed_data[(layer_i, geom_i)] = {
+                            "vertices": mesh_data.get("vertices", []),
+                            "triangles": mesh_data.get("triangles", []),
+                        }
+            else:
+                log.info(f"[预网格] Layer '{layer_data['name']}': "
+                         f"合并后几何数({n_merged})≠原始数({n_original})，"
+                         f"丢弃预网格数据，使用 Python 网格器")
+
+    node_id_cache: dict[str, problem.NodeID] = {}
+
+    def get_node_id(key: str) -> problem.NodeID:
+        if key not in node_id_cache:
+            node_id_cache[key] = problem.NodeID()
+        return node_id_cache[key]
+
+    layer_by_name = {layer.name: layer for layer in layers}
+
+    networks = []
+    for net_data in data.networks:
+        connections = []
+        for conn_data in net_data.get("connections", []):
+            layer_name = conn_data["layer_name"]
+            layer_obj = layer_by_name.get(layer_name)
+            if layer_obj is None:
+                log.warning(f"连接引用了未知层: {layer_name}，跳过")
+                continue
+            px, py = conn_data["point"]
+            point = shapely.geometry.Point(px, py)
+            node_id = get_node_id(conn_data["node_id"])
+            connections.append(problem.Connection(
+                layer=layer_obj,
+                point=point,
+                node_id=node_id,
+            ))
+
+        elements = []
+        for el_data in net_data.get("elements", []):
+            el_type = el_data["type"]
+            if el_type == "resistor":
+                elements.append(problem.Resistor(
+                    a=get_node_id(el_data["a"]),
+                    b=get_node_id(el_data["b"]),
+                    resistance=el_data["resistance"],
+                ))
+            elif el_type == "voltage_source":
+                elements.append(problem.VoltageSource(
+                    p=get_node_id(el_data["p"]),
+                    n=get_node_id(el_data["n"]),
+                    voltage=el_data["voltage"],
+                ))
+            elif el_type == "current_source":
+                elements.append(problem.CurrentSource(
+                    f=get_node_id(el_data["f"]),
+                    t=get_node_id(el_data["t"]),
+                    current=el_data["current"],
+                ))
+            elif el_type == "voltage_regulator":
+                elements.append(problem.VoltageRegulator(
+                    v_p=get_node_id(el_data["v_p"]),
+                    v_n=get_node_id(el_data["v_n"]),
+                    s_f=get_node_id(el_data["s_f"]),
+                    s_t=get_node_id(el_data["s_t"]),
+                    voltage=el_data["voltage"],
+                    gain=el_data["gain"],
+                ))
+
+        if connections or elements:
+            # 过滤掉 node_id 不在任何 element terminal 中的 connection
+            node_set = set()
+            for el in elements:
+                for t in el.terminals:
+                    node_set.add(t)
+            valid_connections = [c for c in connections if c.node_id in node_set]
+            dropped = len(connections) - len(valid_connections)
+            if dropped > 0:
+                log.warning(f"过滤掉 {dropped} 个未连接到任何元件的 connection")
+            if valid_connections or elements:
+                networks.append(problem.Network(
+                    connections=valid_connections,
+                    elements=elements,
+                ))
+
+    return problem.Problem(
+        layers=layers,
+        networks=networks,
+        project_name=data.project_name,
+    ), pre_meshed_data
+
+
+# ============================================================
+# 序列化：Solution → JSON
+# ============================================================
+
+def serialize_mesh(m: mesh.Mesh) -> tuple[list[list[float]], list[dict]]:
+    """从 Mesh 提取顶点和三角形"""
+    vertices = [[v.p.x, v.p.y] for v in m.vertices]
+    triangles = []
+    for face in m.faces:
+        verts = list(face.vertices)
+        if len(verts) == 3:
+            triangles.append({
+                "vertices": [verts[0].i, verts[1].i, verts[2].i],
+            })
+    return vertices, triangles
+
+
+def serialize_solution(solution: solver.Solution, generate_images: bool = False) -> AnalyzeResponse:
+    """将 solver.Solution 序列化为 JSON 响应"""
+    layer_solutions = []
+    for i, layer_sol in enumerate(solution.layer_solutions):
+        layer_name = solution.problem.layers[i].name if i < len(solution.problem.layers) else f"Layer_{i}"
+        mesh_outputs = []
+        for m, pot, pd in zip(
+            layer_sol.meshes,
+            layer_sol.potentials,
+            layer_sol.power_densities if layer_sol.power_densities else [None] * len(layer_sol.meshes),
+        ):
+            vertices, triangles = serialize_mesh(m)
+            potentials = list(pot.values) if pot else []
+            power_densities = list(pd.values) if pd else []
+            mesh_outputs.append(MeshOutput(
+                vertices=vertices,
+                triangles=[MeshTriangleOutput(**t) for t in triangles],
+                potentials=potentials,
+                power_densities=power_densities,
+            ))
+
+        disconnected_outputs = []
+        for dm in layer_sol.disconnected_meshes:
+            vertices, triangles = serialize_mesh(dm)
+            disconnected_outputs.append(DisconnectedMeshOutput(
+                vertices=vertices,
+                triangles=[MeshTriangleOutput(**t) for t in triangles],
+            ))
+
+        layer_solutions.append(LayerSolutionOutput(
+            layer_name=layer_name,
+            meshes=mesh_outputs,
+            disconnected_meshes=disconnected_outputs,
+        ))
+
+    solver_info = SolverInfoOutput(
+        ground_node_current=solution.solver_info.ground_node_current,
+        residual_norm=solution.solver_info.residual_norm,
+    )
+
+    # 生成可视化图片（仅在前端请求时生成，默认跳过以节省内存）
+    if generate_images and HAS_MATPLOTLIB:
+        log.info(f"matplotlib: 可用，生成可视化图片")
+        try:
+            images = generate_images(solution)
+            log.info(f"可视化图片: {list(images.keys()) if images else '无'}")
+        except Exception as e:
+            log.warning(f"生成可视化图片失败: {e}")
+            images = None
+    else:
+        log.info(f"matplotlib: {'跳过（未请求）' if not generate_images else '不可用'}")
+        images = None
+
+    # 连接点（每层的过孔/焊盘位置）
+    connection_points: dict[str, list[dict]] = {}
+    for network in solution.problem.networks:
+        for conn in network.connections:
+            lname = conn.layer.name
+            if lname not in connection_points:
+                connection_points[lname] = []
+            connection_points[lname].append({
+                'x': float(conn.point.x),
+                'y': float(conn.point.y),
+                'is_source': network.has_source,
+            })
+
+    # 层边界（WebGL 渲染用多边形轮廓）
+    layer_boundaries: dict[str, list[dict]] = {}
+    for layer in solution.problem.layers:
+        polygons = []
+        for geom in layer.geoms:
+            exterior = [[float(c[0]), float(c[1])] for c in geom.exterior.coords]
+            holes = [[[float(c[0]), float(c[1])] for c in interior.coords]
+                     for interior in geom.interiors]
+            polygons.append({'exterior': exterior, 'holes': holes})
+        layer_boundaries[layer.name] = polygons
+
+    return AnalyzeResponse(
+        success=True,
+        message="求解完成",
+        layer_solutions=layer_solutions,
+        solver_info=solver_info,
+        images=images,
+        connection_points=connection_points,
+        layer_boundaries=layer_boundaries,
+    )
+
+
+# ============================================================
+# 可视化：matplotlib 生成 2D/3D 图
+# ============================================================
+
+def fig_to_base64(fig) -> str:
+    """将 matplotlib Figure 编码为 base64 PNG"""
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=200, bbox_inches='tight', facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode('utf-8')
+
+
+def _collect_layer_data(layer_sol) -> tuple | None:
+    """从 layer solution 中收集顶点和电势数据，返回 (x, y, v, triangles, polygons)"""
+    if not layer_sol.meshes:
+        return None
+
+    all_x, all_y, all_v = [], [], []
+    all_triangles = []
+    all_polygons = []
+    offset = 0
+
+    for m, pot in zip(layer_sol.meshes, layer_sol.potentials):
+        n_verts = 0
+        for v in m.vertices:
+            all_x.append(v.p.x)
+            all_y.append(v.p.y)
+            n_verts += 1
+        all_v.extend(pot.values)
+
+        for face in m.faces:
+            verts = list(face.vertices)
+            if len(verts) == 3:
+                all_triangles.append([verts[0].i + offset, verts[1].i + offset, verts[2].i + offset])
+
+        # 收集边界多边形用于轮廓绘制
+        for boundary in m.boundaries:
+            ring = []
+            for edge in boundary.edges:
+                ring.append((edge.origin.p.x, edge.origin.p.y))
+            if len(ring) >= 3:
+                all_polygons.append(ring)
+
+        offset += n_verts
+
+    if len(all_x) < 3:
+        return None
+
+    x = np.array(all_x)
+    y = np.array(all_y)
+    v = np.array(all_v, dtype=float)
+    # 将 NaN/Inf 替换为 0 以便绘图
+    v = np.where(np.isfinite(v), v, 0.0)
+
+    return x, y, v, all_triangles, all_polygons
+
+
+def generate_images(solution: solver.Solution) -> dict:
+    """为每层生成 2D 热力图和 3D 表面图"""
+    images = {"view_3d": None, "layers": {}}
+
+    # 收集每层的连接点（过孔/焊盘位置）
+    layer_connections = {}
+    for layer_i, layer in enumerate(solution.problem.layers):
+        connections = []
+        for network in solution.problem.networks:
+            for conn in network.connections:
+                if conn.layer is layer:
+                    connections.append({'x': conn.point.x, 'y': conn.point.y, 'is_source': network.has_source})
+        layer_connections[layer_i] = connections
+
+    try:
+        images["view_3d"] = generate_3d_plot(solution)
+    except Exception as e:
+        log.warning(f"生成 3D 图失败: {e}")
+
+    for i, layer_sol in enumerate(solution.layer_solutions):
+        layer_name = solution.problem.layers[i].name if i < len(solution.problem.layers) else f"Layer_{i}"
+        try:
+            b64 = generate_2d_plot(
+                layer_sol, layer_name,
+                solution.problem.layers[i],
+                connection_points=layer_connections.get(i, [])
+            )
+            if b64:
+                images["layers"][layer_name] = b64
+        except Exception as e:
+            log.warning(f"生成层 {layer_name} 热力图失败: {e}")
+
+    return images
+
+
+def generate_2d_plot(layer_sol, layer_name: str, layer=None, connection_points=None) -> str | None:
+    """生成专业级 2D 电压分布热力图，使用插值平滑渲染 + 过孔标记"""
+    from scipy.interpolate import griddata
+    from matplotlib.path import Path as MplPath
+    from matplotlib.patches import Circle
+    from matplotlib.colors import Normalize
+
+    data = _collect_layer_data(layer_sol)
+    if data is None:
+        return None
+
+    x, y, v, triangles, polygons = data
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    fig.patch.set_facecolor('#1a1a2e')
+    ax.set_facecolor('#0d1117')
+
+    v_min, v_max = float(v.min()), float(v.max())
+    v_range = v_max - v_min
+    if v_range < 1e-10:
+        v_range = 1.0
+        v_min = v_min - 0.5
+        v_max = v_max + 0.5
+
+    # 密集网格用于平滑插值
+    margin = max((x.max() - x.min()), (y.max() - y.min())) * 0.02 + 0.5
+    x_lo, x_hi = float(x.min()) - margin, float(x.max()) + margin
+    y_lo, y_hi = float(y.min()) - margin, float(y.max()) + margin
+
+    grid_res = 400
+    xi = np.linspace(x_lo, x_hi, grid_res)
+    yi = np.linspace(y_lo, y_hi, grid_res)
+    xi_grid, yi_grid = np.meshgrid(xi, yi)
+
+    # 三次插值生成平滑热力图
+    vi = griddata((x, y), v, (xi_grid, yi_grid), method='cubic')
+    # 用最近邻插值填充 NaN 空缺
+    vi_nn = griddata((x, y), v, (xi_grid, yi_grid), method='nearest')
+    nan_mask = np.isnan(vi)
+    vi[nan_mask] = vi_nn[nan_mask]
+
+    # 掩码：隐藏铜皮外部和过孔孔洞内部
+    if layer and hasattr(layer, 'geoms'):
+        grid_pts = np.column_stack([xi_grid.ravel(), yi_grid.ravel()])
+
+        # 铜皮内部的点（外环）
+        ext_mask = np.zeros(grid_res * grid_res, dtype=bool)
+        for geom in layer.geoms:
+            coords = list(geom.exterior.coords)
+            if len(coords) < 3:
+                continue
+            path = MplPath([(c[0], c[1]) for c in coords])
+            ext_mask |= path.contains_points(grid_pts)
+        ext_mask = ext_mask.reshape(xi_grid.shape)
+
+        # 孔洞内部的点（过孔、挖空）
+        hole_mask = np.zeros(grid_res * grid_res, dtype=bool)
+        for geom in layer.geoms:
+            for interior in geom.interiors:
+                coords = list(interior.coords)
+                if len(coords) < 3:
+                    continue
+                path = MplPath([(c[0], c[1]) for c in coords])
+                hole_mask |= path.contains_points(grid_pts)
+        hole_mask = hole_mask.reshape(xi_grid.shape)
+
+        mask = ~ext_mask | hole_mask
+        vi_masked = np.ma.array(vi, mask=mask)
+    else:
+        vi_masked = np.ma.array(vi)
+
+    # 渲染热力图
+    norm = Normalize(v_min, v_max)
+    extent = [x_lo, x_hi, y_lo, y_hi]
+    im = ax.imshow(vi_masked, extent=extent, origin='lower', cmap='plasma',
+                   norm=norm, aspect='equal', interpolation='bilinear')
+
+    # 淡色等高线
+    try:
+        levels = np.linspace(v_min, v_max, 13)
+        ax.contour(xi_grid, yi_grid, vi_masked.filled(v_min),
+                   levels=levels, colors='white', linewidths=0.3, alpha=0.15)
+    except Exception:
+        pass
+
+    # 网格边叠加（淡灰色三角边线）
+    if triangles:
+        from matplotlib.collections import LineCollection
+        segments = []
+        for tri in triangles:
+            for i in range(3):
+                j = (i + 1) % 3
+                segments.append([(x[tri[i]], y[tri[i]]), (x[tri[j]], y[tri[j]])])
+        lc = LineCollection(segments, colors='#555577', linewidths=0.15, alpha=0.25, zorder=2)
+        ax.add_collection(lc)
+
+    # 绘制铜皮轮廓并填充孔洞
+    if layer and hasattr(layer, 'geoms'):
+        for geom in layer.geoms:
+            coords = list(geom.exterior.coords)
+            gx = [c[0] for c in coords]
+            gy = [c[1] for c in coords]
+            ax.plot(gx, gy, color='#00d4ff', linewidth=1.0, alpha=0.7, zorder=4)
+
+            for interior in geom.interiors:
+                ic = list(interior.coords)
+                ix = [c[0] for c in ic]
+                iy = [c[1] for c in ic]
+                ax.fill(ix, iy, color='#0d1117', zorder=3)
+                ax.plot(ix, iy, color='#333355', linewidth=0.8, alpha=0.6, zorder=4)
+
+    # 绘制过孔标记：红色=源网络，灰色=非源
+    if connection_points and len(connection_points) > 0:
+        pcb_size = max(x_hi - x_lo, y_hi - y_lo)
+        pad_r = pcb_size * 0.008
+        drill_r = pad_r * 0.5
+
+        for cp in connection_points:
+            px, py = cp['x'], cp['y']
+            is_source = cp.get('is_source', False)
+            ring_color = (1.0, 0.0, 0.0) if is_source else (0.5, 0.5, 0.5)
+
+            # 外环（源=红色，非源=灰色）
+            ring = Circle((px, py), radius=pad_r,
+                          facecolor=ring_color, edgecolor='#1a1a1a',
+                          linewidth=1.2, zorder=6, alpha=0.9)
+            ax.add_patch(ring)
+            # 钻孔（深色中心）
+            drill = Circle((px, py), radius=drill_r,
+                           facecolor='#0d1117', edgecolor='#333333',
+                           linewidth=0.6, zorder=7)
+            ax.add_patch(drill)
+
+    # 颜色条
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02, aspect=30)
+    cbar.set_label('Voltage (V)', color='white', fontsize=11)
+    cbar.ax.yaxis.set_tick_params(color='white')
+    plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
+
+    ax.set_xlabel('X (mm)', color='white', fontsize=10)
+    ax.set_ylabel('Y (mm)', color='white', fontsize=10)
+    ax.set_title(f'{layer_name} — Voltage Distribution', color='white', fontsize=13, fontweight='bold', pad=12)
+    ax.tick_params(colors='white', labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_color('#444466')
+
+    # 计算连接点（焊盘/过孔）处的电压，得到更准确的 IR Drop
+    v_source = v_max
+    v_load = v_min
+    if connection_points and len(connection_points) > 0:
+        from scipy.interpolate import griddata
+        cp_coords = np.array([(cp['x'], cp['y']) for cp in connection_points])
+        cp_is_source = [cp.get('is_source', False) for cp in connection_points]
+        cp_voltages = griddata((x, y), v, cp_coords, method='nearest')
+
+        source_voltages = cp_voltages[np.array(cp_is_source, dtype=bool)]
+        load_voltages = cp_voltages[~np.array(cp_is_source, dtype=bool)]
+
+        if len(source_voltages) > 0:
+            v_source = float(np.max(source_voltages))
+        if len(load_voltages) > 0:
+            v_load = float(np.min(load_voltages))
+
+    v_drop = v_source - v_load
+    ax.text(0.02, 0.02,
+            f'V source: {v_source:.4f} V | V load: {v_load:.4f} V\nIR Drop: {v_drop:.4f} V',
+            transform=ax.transAxes, fontsize=9, color='#ffdd57',
+            verticalalignment='bottom',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#0f3460', alpha=0.85, edgecolor='#444466'))
+
+    plt.tight_layout()
+    return fig_to_base64(fig)
+
+
+def generate_3d_plot(solution: solver.Solution) -> str | None:
+    """生成专业级 3D 表面图：电压作为高度，多层叠加"""
+    has_data = any(ls.meshes for ls in solution.layer_solutions)
+    if not has_data:
+        return None
+
+    fig = plt.figure(figsize=(14, 9))
+    fig.patch.set_facecolor('#1a1a2e')
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_facecolor('#16213e')
+
+    # 计算全局电压范围以保持一致的配色
+    global_vmin = float('inf')
+    global_vmax = float('-inf')
+    for layer_sol in solution.layer_solutions:
+        data = _collect_layer_data(layer_sol)
+        if data is None:
+            continue
+        _, _, v, _, _ = data
+        if len(v) > 0:
+            global_vmin = min(global_vmin, v.min())
+            global_vmax = max(global_vmax, v.max())
+    if global_vmin == float('inf'):
+        return None
+
+    z_step = 2.0 / max(len(solution.problem.layers), 1)
+    layer_colors = ['#00d4ff', '#ff6b6b', '#51cf66', '#ffd43b', '#cc5de8', '#ff922b']
+
+    for i, layer_sol in enumerate(solution.layer_solutions):
+        data = _collect_layer_data(layer_sol)
+        if data is None:
+            continue
+
+        x, y, v, triangles, _ = data
+        z_base = i * z_step
+        z = v + z_base
+
+        color = layer_colors[i % len(layer_colors)]
+
+        if triangles:
+            triang = mtri.Triangulation(x, y, triangles)
+        else:
+            triang = mtri.Triangulation(x, y)
+
+        try:
+            norm = plt.Normalize(global_vmin, global_vmax)
+            surf = ax.plot_trisurf(triang, z, cmap='plasma', norm=norm, alpha=0.85,
+                                   edgecolor='none', antialiased=True)
+        except Exception:
+            ax.scatter(x, y, z, c=v, cmap='plasma', s=3, alpha=0.6, norm=norm)
+
+        # 层标签
+        mid_x = (x.min() + x.max()) / 2
+        mid_y = (y.min() + y.max()) / 2
+        layer_name = solution.problem.layers[i].name if i < len(solution.problem.layers) else f"Layer_{i}"
+        ax.text(mid_x, y.max() * 1.05, z_base + 0.1, layer_name,
+                color=color, fontsize=10, fontweight='bold', ha='center')
+
+    # 样式
+    ax.set_xlabel('X (mm)', color='white', fontsize=10, labelpad=8)
+    ax.set_ylabel('Y (mm)', color='white', fontsize=10, labelpad=8)
+    ax.set_zlabel('Layer + Voltage', color='white', fontsize=10, labelpad=8)
+    ax.set_title('PDN 3D Voltage Distribution', color='white', fontsize=14, fontweight='bold', pad=15)
+
+    ax.tick_params(colors='white', labelsize=8)
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    ax.xaxis.pane.set_edgecolor('#333355')
+    ax.yaxis.pane.set_edgecolor('#333355')
+    ax.zaxis.pane.set_edgecolor('#333355')
+    ax.grid(True, alpha=0.15, color='white')
+
+    # 颜色条
+    sm = plt.cm.ScalarMappable(cmap='plasma', norm=plt.Normalize(global_vmin, global_vmax))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.08, aspect=20)
+    cbar.set_label('Voltage (V)', color='white', fontsize=10)
+    cbar.ax.yaxis.set_tick_params(color='white')
+    plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
+
+    plt.tight_layout()
+    return fig_to_base64(fig)
+
+
+# ============================================================
+# 预网格求解：复用 solver 底层函数，跳过网格剖分
+# ============================================================
+
+def _generate_meshes_with_pre_meshed(
+    prob: problem.Problem,
+    connected_layer_mesh_pairs: set[tuple[int, int]],
+    strtrees: list,
+    pre_meshed_data: dict,
+) -> tuple[list, list[int]]:
+    """使用客户端预网格数据生成 Mesh 对象，替代 solver.generate_meshes_for_problem()"""
+    meshes: list = []
+    mesh_index_to_layer_index: list[int] = []
+    mesher_instance = mesh.Mesher()
+
+    # 收集每层每几何体的 seed points（与 solver.generate_meshes_for_problem 一致）
+    import collections
+    for layer_i, layer in enumerate(prob.layers):
+        # 收集该层所有 seed points
+        all_seed_points = solver.collect_seed_points(prob, layer)
+        # 按 geom 分配 seed points
+        geom_to_seeds = collections.defaultdict(list)
+        for sp in all_seed_points:
+            shapely_pt = shapely.geometry.Point(sp.x, sp.y)
+            for geom_i, geom in enumerate(layer.geoms):
+                if (layer_i, geom_i) not in connected_layer_mesh_pairs:
+                    continue
+                if geom.contains(shapely_pt):
+                    geom_to_seeds[geom_i].append(sp)
+                    break
+
+        for geom_i, geom in enumerate(layer.geoms):
+            if (layer_i, geom_i) not in connected_layer_mesh_pairs:
+                continue
+
+            pre_meshed = pre_meshed_data.get((layer_i, geom_i))
+            if pre_meshed and len(pre_meshed.get("vertices", [])) >= 3 and len(pre_meshed.get("triangles", [])) >= 1:
+                log.info(f"使用预网格数据: layer {layer_i} geom {geom_i}, "
+                         f"{len(pre_meshed['vertices'])} 顶点, {len(pre_meshed['triangles'])} 三角形")
+                pts = [mesh.Point(v[0], v[1]) for v in pre_meshed["vertices"]]
+                tris = [tuple(t) for t in pre_meshed["triangles"]]
+                m = mesh.Mesh.from_triangle_soup(pts, tris)
+                if len(m.vertices) == 0:
+                    log.warning(f"预网格结果为空，回退到标准网格剖分: layer {layer_i} geom {geom_i}")
+                    m = mesher_instance.poly_to_mesh(geom, geom_to_seeds.get(geom_i, []))
+            else:
+                seeds = geom_to_seeds.get(geom_i, [])
+                log.info(f"标准网格剖分: layer {layer_i} geom {geom_i}, seed_points={len(seeds)}")
+                m = mesher_instance.poly_to_mesh(geom, seeds)
+
+            if len(m.vertices) == 0:
+                log.warning(f"跳过空网格: layer {layer_i} geom {geom_i}")
+                continue
+
+            meshes.append(m)
+            mesh_index_to_layer_index.append(layer_i)
+
+    return meshes, mesh_index_to_layer_index
+
+
+def _snap_connection_points(prob: problem.Problem) -> None:
+    """将连接点吸附到最近的几何体边界，确保 solver 中 intersects() 返回 True。
+    距离 >5mm 的点沿铜皮边界均匀分布，避免 KDTree 将多个不同 NodeID 映射到同一网格顶点。"""
+    SNAP_MAX_DIST = 5.0  # mm
+    snapped_count = 0
+
+    # Phase 1: 吸附近距连接点 (<=5mm)
+    far_by_layer = {}  # layer -> list of (conn, dist)
+    for network in prob.networks:
+        for conn in network.connections:
+            geoms = conn.layer.geoms
+            if not geoms:
+                continue
+            on_copper = any(g.intersects(conn.point) for g in geoms)
+            if on_copper:
+                continue
+            nearest_geom = min(geoms, key=lambda g: g.distance(conn.point))
+            dist = nearest_geom.distance(conn.point)
+            if dist <= SNAP_MAX_DIST:
+                _, nearest_pt = shapely.ops.nearest_points(conn.point, nearest_geom)
+                log.info(f"[Snap] {conn.layer.name}: ({conn.point.x:.3f}, {conn.point.y:.3f}) "
+                         f"-> ({nearest_pt.x:.3f}, {nearest_pt.y:.3f}), dist={dist:.3f}")
+                object.__setattr__(conn, 'point', nearest_pt)
+                snapped_count += 1
+            else:
+                layer = conn.layer
+                if layer not in far_by_layer:
+                    far_by_layer[layer] = []
+                far_by_layer[layer].append((conn, dist))
+
+    if snapped_count > 0:
+        log.info(f"[Snap] 共吸附 {snapped_count} 个近距连接点")
+
+    # Phase 2: 将远距连接沿铜皮边界均匀分布，确保映射到不同网格顶点
+    distributed_count = 0
+    for layer, far_conns in far_by_layer.items():
+        geoms = layer.geoms
+        main_geom = max(geoms, key=lambda g: g.area)
+        exterior = main_geom.exterior
+        perimeter = exterior.length
+        interior_pt = main_geom.representative_point()
+        n = len(far_conns)
+
+        log.info(f"[Distribute] {layer.name}: {n} 个远距连接分布到铜皮边界 "
+                 f"(周长={perimeter:.1f}mm, 面积={main_geom.area:.1f}mm²)")
+
+        for i, (conn, orig_dist) in enumerate(far_conns):
+            frac = (i + 0.5) / n  # 均匀间距 + 半步偏移
+            pt_on_boundary = exterior.interpolate(frac * perimeter)
+
+            # 向内偏移 0.05mm 确保 contains() 返回 True
+            dx = interior_pt.x - pt_on_boundary.x
+            dy = interior_pt.y - pt_on_boundary.y
+            d = (dx * dx + dy * dy) ** 0.5
+            if d > 0:
+                offset = 0.05  # mm
+                new_x = pt_on_boundary.x + dx / d * offset
+                new_y = pt_on_boundary.y + dy / d * offset
+            else:
+                new_x, new_y = pt_on_boundary.x, pt_on_boundary.y
+
+            new_point = shapely.geometry.Point(new_x, new_y)
+            log.info(f"[Distribute] #{i}: ({conn.point.x:.1f}, {conn.point.y:.1f}) "
+                     f"[距铜皮 {orig_dist:.1f}mm] -> ({new_x:.1f}, {new_y:.1f}) "
+                     f"@ {layer.name}")
+            object.__setattr__(conn, 'point', new_point)
+            distributed_count += 1
+
+    if distributed_count > 0:
+        log.info(f"[Distribute] 共分布 {distributed_count} 个远距连接点")
+
+
+def _find_best_ground_node_index(filtered_networks: list, node_indexer) -> int:
+    """从过滤后的网络中查找接地节点索引（避免访问被过滤掉的网络导致 KeyError）。"""
+    max_voltage = float('-inf')
+    ground_node_index = None
+    for network in filtered_networks:
+        for element in network.elements:
+            if not isinstance(element, problem.VoltageSource):
+                continue
+            if element.n not in node_indexer.node_to_global_index:
+                log.warning(f"VoltageSource 的 n 节点不在 node_indexer 中，跳过")
+                continue
+            if element.voltage > max_voltage:
+                max_voltage = element.voltage
+                ground_node_index = node_indexer.node_to_global_index[element.n]
+    if ground_node_index is None:
+        log.warning("未找到有效的 GND 节点，使用 node_indexer 中最后一个内部节点")
+        # 内部节点在 mesh_verts 之后，取最后一个内部节点
+        all_indices = sorted(node_indexer.node_to_global_index.values())
+        ground_node_index = all_indices[-1] if all_indices else 0
+    log.info(f"接地节点全局索引: {ground_node_index}")
+    return ground_node_index
+
+
+class DiagnosticsCollector:
+    """收集求解管线各阶段的诊断信息，供前端展示。"""
+
+    def __init__(self):
+        self._lines: list[str] = []
+
+    def section(self, title: str):
+        self._lines.append(f"\n{'='*20} {title} {'='*20}")
+
+    def add(self, line: str):
+        self._lines.append(line)
+
+    def result(self) -> list[str]:
+        return list(self._lines)
+
+
+def solve_with_pre_meshed(prob: problem.Problem, pre_meshed_data: dict,
+                          diag: DiagnosticsCollector | None = None) -> solver.Solution:
+    """与 solver.solve() 相同流程，但使用客户端预网格数据跳过网格剖分。"""
+    log.info("使用预网格数据求解")
+    if diag is None:
+        diag = DiagnosticsCollector()
+
+    # ── 1. 输入参数概览 ──
+    diag.section("1. 输入参数")
+    diag.add(f"层数: {len(prob.layers)}")
+    diag.add(f"网络数: {len(prob.networks)}")
+    for li, layer in enumerate(prob.layers):
+        diag.add(f"  Layer {li} '{layer.name}': conductance={layer.conductance:.4f} S, "
+                 f"geoms={len(layer.geoms)}")
+    for ni, net in enumerate(prob.networks):
+        vs = [e for e in net.elements if isinstance(e, problem.VoltageSource)]
+        cs = [e for e in net.elements if isinstance(e, problem.CurrentSource)]
+        rs = [e for e in net.elements if isinstance(e, problem.Resistor)]
+        diag.add(f"  Network {ni}: conns={len(net.connections)}, "
+                 f"VS={len(vs)}, CS={len(cs)}, R={len(rs)}, has_source={net.has_source}")
+        for ei, elem in enumerate(net.elements):
+            if isinstance(elem, problem.VoltageSource):
+                diag.add(f"    VS[{ei}]: p={elem.p}, n={elem.n}, V={elem.voltage}")
+            elif isinstance(elem, problem.CurrentSource):
+                diag.add(f"    CS[{ei}]: f={elem.f}, t={elem.t}, I={elem.current}")
+            elif isinstance(elem, problem.Resistor):
+                diag.add(f"    R[{ei}]: a={elem.a}, b={elem.b}, R={elem.resistance}")
+
+    # ── 2. 连接点吸附 ──
+    diag.section("2. 连接点吸附 (snap)")
+    snap_log = []
+    for network in prob.networks:
+        for conn in network.connections:
+            geoms = conn.layer.geoms
+            if not geoms:
+                continue
+            if not any(g.intersects(conn.point) for g in geoms):
+                snap_log.append(f"  ({conn.point.x:.3f}, {conn.point.y:.3f}) @ {conn.layer.name} "
+                                f"不在铜皮内 (距最近={min(g.distance(conn.point) for g in geoms):.4f})")
+    if snap_log:
+        diag.add(f"需要吸附的连接点: {len(snap_log)}")
+        for s in snap_log[:20]:
+            diag.add(s)
+        if len(snap_log) > 20:
+            diag.add(f"  ... 还有 {len(snap_log) - 20} 个")
+    else:
+        diag.add("所有连接点均在铜皮内，无需吸附")
+
+    _snap_connection_points(prob)
+
+    # ── 3. 连通性分析 ──
+    diag.section("3. 连通性分析")
+    strtrees = solver.construct_strtrees_from_layers(prob.layers)
+    connectivity_graph = solver.ConnectivityGraph.create_from_problem(prob, strtrees)
+    connected_layer_mesh_pairs = solver.find_connected_layer_geom_indices(connectivity_graph)
+
+    for li, layer in enumerate(prob.layers):
+        n_geoms = len(layer.geoms)
+        connected = [g for l, g in connected_layer_mesh_pairs if l == li]
+        disconnected = [g for g in range(n_geoms) if g not in connected]
+        diag.add(f"  Layer {li} '{layer.name}': {n_geoms} 几何, "
+                 f"连通={connected}, 断开={disconnected}")
+
+    # ── 4. 网格生成 ──
+    diag.section("4. 网格生成")
+    meshes, mesh_index_to_layer_index = _generate_meshes_with_pre_meshed(
+        prob, connected_layer_mesh_pairs, strtrees, pre_meshed_data
+    )
+    disconnected_meshes_by_layer = solver.generate_disconnected_meshes(prob, connected_layer_mesh_pairs)
+
+    total_verts = 0
+    total_tris = 0
+    for mi, msh in enumerate(meshes):
+        li = mesh_index_to_layer_index[mi]
+        nv = len(msh.vertices)
+        nt = len(msh.faces)
+        total_verts += nv
+        total_tris += nt
+        diag.add(f"  Mesh {mi} (Layer {li} '{prob.layers[li].name}'): "
+                 f"{nv} 顶点, {nt} 三角形")
+    diag.add(f"总计: {len(meshes)} 网格, {total_verts} 顶点, {total_tris} 三角形")
+
+    # ── 5. 网络过滤 ──
+    diag.section("5. 网络过滤 (死端检测)")
+    vindex = solver.VertexIndexer.create(meshes)
+
+    dead_networks = []
+    for ni, net in enumerate(prob.networks):
+        if solver.network_has_a_dead_terminal(net, prob, connected_layer_mesh_pairs, strtrees):
+            dead_networks.append(ni)
+            dead_conns = []
+            for conn in net.connections:
+                layer_i = prob.layers.index(conn.layer)
+                hits = any((layer_i, gi) in connected_layer_mesh_pairs
+                           for gi in range(len(conn.layer.geoms))
+                           if conn.layer.geoms[gi].intersects(conn.point))
+                if not hits:
+                    dead_conns.append(f"      ({conn.point.x:.2f}, {conn.point.y:.2f}) @ {conn.layer.name}")
+            diag.add(f"  Network {ni}: 被过滤 (有死端)")
+            for dc in dead_conns[:5]:
+                diag.add(dc)
+
+    filtered_networks = [
+        net for net in prob.networks
+        if not solver.network_has_a_dead_terminal(net, prob, connected_layer_mesh_pairs, strtrees)
+    ]
+    diag.add(f"过滤结果: {len(filtered_networks)}/{len(prob.networks)} 网络保留")
+    if dead_networks:
+        diag.add(f"被过滤的网络: {dead_networks}")
+
+    # ── 6. 节点索引 ──
+    diag.section("6. 节点索引")
+    node_indexer = solver.NodeIndexer.create(
+        prob, meshes, mesh_index_to_layer_index, vindex, filtered_networks
+    )
+
+    N = (len(vindex.global_index_to_vertex_index)
+         + node_indexer.internal_node_count
+         + len(node_indexer.extra_source_to_global_index)
+         + 1)
+    diag.add(f"网格顶点变量: {len(vindex.global_index_to_vertex_index)}")
+    diag.add(f"内部节点 (无物理连接): {node_indexer.internal_node_count}")
+    diag.add(f"额外源变量 (电压源/稳压器电流): {len(node_indexer.extra_source_to_global_index)}")
+    diag.add(f"接地变量: 1")
+    diag.add(f"系统矩阵大小: {N}x{N}")
+
+    # 列出内部节点详情
+    internal_nodes = [
+        (nid, idx) for nid, idx in node_indexer.node_to_global_index.items()
+        if idx >= len(vindex.global_index_to_vertex_index)
+        and idx not in set(node_indexer.extra_source_to_global_index.values())
+    ]
+    if internal_nodes:
+        diag.add("内部节点详情:")
+        for nid, idx in internal_nodes[:10]:
+            diag.add(f"  {nid} -> global[{idx}]")
+        if len(internal_nodes) > 10:
+            diag.add(f"  ... 还有 {len(internal_nodes) - 10} 个")
+
+    # ── 6b. 连接点→网格→几何体 映射 ──
+    diag.section("6b. 源/载焊盘连接映射")
+    # 构建 mesh_i → (layer_i, geom_i) 的映射
+    mesh_to_geom = {}
+    geom_idx = 0
+    for li, layer in enumerate(prob.layers):
+        for gi in range(len(layer.geoms)):
+            if (li, gi) in connected_layer_mesh_pairs:
+                mesh_to_geom[geom_idx] = (li, gi)
+                geom_idx += 1
+    for ni, net in enumerate(filtered_networks):
+        vs_terminals = set()
+        cs_terminals = set()
+        for elem in net.elements:
+            if isinstance(elem, problem.VoltageSource):
+                vs_terminals.add(elem.p)
+            elif isinstance(elem, problem.CurrentSource):
+                cs_terminals.add(elem.t)
+        for conn in net.connections:
+            layer_i = prob.layers.index(conn.layer)
+            gidx = node_indexer.node_to_global_index.get(conn.node_id)
+            if gidx is None:
+                continue
+            # 找到这个连接点映射到哪个 mesh
+            mesh_found = None
+            for mi, msh in enumerate(meshes):
+                li = mesh_index_to_layer_index[mi]
+                if li != layer_i:
+                    continue
+                for vi, vertex in enumerate(msh.vertices):
+                    vgi = vindex.mesh_vertex_index_to_global_index[(mi, vi)]
+                    if vgi == gidx:
+                        mesh_found = mi
+                        break
+                if mesh_found is not None:
+                    break
+            is_vs = conn.node_id in vs_terminals
+            is_cs = conn.node_id in cs_terminals
+            tag = "VS+" if is_vs else ("CS+" if is_cs else "via/pad")
+            geom_info = ""
+            if mesh_found is not None and mesh_found in mesh_to_geom:
+                gli, ggi = mesh_to_geom[mesh_found]
+                geom_info = f", geom=({gli},{ggi})"
+            diag.add(f"  {tag} global[{gidx}] @ Layer {layer_i} '{conn.layer.name}' "
+                     f"({conn.point.x:.2f},{conn.point.y:.2f}) "
+                     f"mesh={mesh_found}{geom_info}")
+
+    # === 内存保护 ===
+    if N > MAX_SYSTEM_SIZE:
+        gc.collect()
+        raise MemoryError(
+            f"系统矩阵过大 ({N}x{N} > {MAX_SYSTEM_SIZE}x{MAX_SYSTEM_SIZE})，"
+            f"请简化铺铜区域或减少分析网络"
+        )
+    _check_memory("构建矩阵前")
+    gc.collect()
+
+    L = scipy.sparse.lil_matrix((N, N), dtype=solver.DTYPE)
+    r = np.zeros(N, dtype=solver.DTYPE)
+
+    # ── 7. Laplacian 构建 ──
+    diag.section("7. Laplacian 算子")
+    mesh_conductances = [
+        prob.layers[mesh_index_to_layer_index[i]].conductance
+        for i in range(len(meshes))
+    ]
+    solver.process_mesh_laplace_operators(meshes, mesh_conductances, vindex, L)
+
+    for mi, cond in enumerate(mesh_conductances):
+        li = mesh_index_to_layer_index[mi]
+        diag.add(f"  Mesh {mi} (Layer {li}): conductance={cond:.4f} S")
+    diag.add(f"Laplacian 非零元素: {L.nnz}")
+
+    # ── 8. 正则化 ──
+    diag.section("8. 正则化")
+    if len(mesh_conductances) > 0:
+        ref_conductance = max(mesh_conductances)
+    else:
+        ref_conductance = 1.0
+    reg_value = ref_conductance * 1e-6
+    diag.add(f"ref_conductance (最大层电导) = {ref_conductance:.4f} S")
+    diag.add(f"reg_value = ref_conductance * 1e-6 = {reg_value:.6e} S")
+    zero_diag = 0
+    weak_diag = 0
+    for i in range(N - 1):
+        if L[i, i] == 0:
+            L[i, i] = reg_value
+            zero_diag += 1
+        elif abs(L[i, i]) < reg_value:
+            L[i, i] += reg_value
+            weak_diag += 1
+    diag.add(f"零对角线顶点 (加正则化): {zero_diag}")
+    diag.add(f"弱对角线顶点 (加正则化): {weak_diag}")
+    if zero_diag > 0:
+        diag.add("!! 零对角线意味着这些顶点没有任何电连接, 正则化会引入虚假电流泄漏")
+
+    # ── 9. 网络元件 stamp ──
+    diag.section("9. 网络元件 Stamp")
+    for network in filtered_networks:
+        solver.stamp_network_into_system(network, node_indexer, L, r)
+
+    # 统计右端项
+    r_nonzero = np.count_nonzero(r[:-1])
+    diag.add(f"右端项 r 非零元素 (不含接地行): {r_nonzero}")
+    for i in range(N - 1):
+        if r[i] != 0:
+            diag.add(f"  r[{i}] = {r[i]:.6e}")
+
+    # ── 9b. 电流路径连通性检查 (VS+ → CS+) ──
+    diag.section("9b. 电流路径连通性 (VS+ → CS+)")
+    n_vars = N - 1
+    adj = L[:n_vars, :n_vars].tocsr()
+    adj_binary = adj.copy()
+    adj_binary.data[:] = 1  # 只关心连接性
+
+    vs_global_indices = []
+    cs_global_indices = []
+    for elem in filtered_networks[0].elements if filtered_networks else []:
+        if isinstance(elem, problem.VoltageSource):
+            p_idx = node_indexer.node_to_global_index.get(elem.p)
+            if p_idx is not None:
+                vs_global_indices.append(p_idx)
+        elif isinstance(elem, problem.CurrentSource):
+            t_idx = node_indexer.node_to_global_index.get(elem.t)
+            if t_idx is not None:
+                cs_global_indices.append(t_idx)
+
+    if vs_global_indices and cs_global_indices:
+        for vi, vs_idx in enumerate(vs_global_indices):
+            visited = {vs_idx}
+            queue = [vs_idx]
+            found_cs = []
+            while queue:
+                cur = queue.pop(0)
+                if cur in cs_global_indices:
+                    found_cs.append(cur)
+                row_start = adj_binary.indptr[cur]
+                row_end = adj_binary.indptr[cur + 1]
+                for ci in range(row_start, row_end):
+                    nb = adj_binary.indices[ci]
+                    if nb not in visited and nb < n_vars:
+                        visited.add(nb)
+                        queue.append(nb)
+            status = "OK" if found_cs else "!! 断路"
+            diag.add(f"  VS[{vi}] global[{vs_idx}] -> CS: {status} "
+                     f"(可达 {len(found_cs)}/{len(cs_global_indices)}, "
+                     f"遍历 {len(visited)} 节点)")
+            if not found_cs:
+                diag.add(f"    !! 电压源正极 global[{vs_idx}] 到负载端无电流路径!")
+
+        for ci, cs_idx in enumerate(cs_global_indices):
+            visited = {cs_idx}
+            queue = [cs_idx]
+            found_vs = []
+            while queue:
+                cur = queue.pop(0)
+                if cur in vs_global_indices:
+                    found_vs.append(cur)
+                row_start = adj_binary.indptr[cur]
+                row_end = adj_binary.indptr[cur + 1]
+                for ni2 in range(row_start, row_end):
+                    nb = adj_binary.indices[ni2]
+                    if nb not in visited and nb < n_vars:
+                        visited.add(nb)
+                        queue.append(nb)
+            status = "OK" if found_vs else "!! 断路"
+            diag.add(f"  CS[{ci}] global[{cs_idx}] <- VS: {status} "
+                     f"(可达 {len(found_vs)}/{len(vs_global_indices)}, "
+                     f"遍历 {len(visited)} 节点)")
+            if not found_vs:
+                diag.add(f"    !! 负载端 global[{cs_idx}] 无法从任何电压源获得电流!")
+    else:
+        diag.add(f"VS+ 端: {len(vs_global_indices)}, CS+ 端: {len(cs_global_indices)} — 跳过检查")
+
+    # ── 10. 接地节点 ──
+    diag.section("10. 接地节点")
+    i_gnd = _find_best_ground_node_index(filtered_networks, node_indexer)
+    diag.add(f"接地节点全局索引: i_gnd = {i_gnd}")
+
+    # 找到该接地节点对应的元件
+    for nid, gidx in node_indexer.node_to_global_index.items():
+        if gidx == i_gnd:
+            diag.add(f"接地节点 ID: {nid}")
+            break
+
+    # 统计哪些元件连接到接地节点
+    gnd_connections = []
+    for ni, net in enumerate(filtered_networks):
+        for ei, elem in enumerate(net.elements):
+            if isinstance(elem, problem.VoltageSource):
+                i_n = node_indexer.node_to_global_index.get(elem.n)
+                if i_n == i_gnd:
+                    i_p = node_indexer.node_to_global_index.get(elem.p)
+                    gnd_connections.append(
+                        f"  Network {ni} VS[{ei}]: n->GND, p->global[{i_p}], V={elem.voltage}")
+            if isinstance(elem, problem.CurrentSource):
+                i_f = node_indexer.node_to_global_index.get(elem.f)
+                if i_f == i_gnd:
+                    i_t = node_indexer.node_to_global_index.get(elem.t)
+                    gnd_connections.append(
+                        f"  Network {ni} CS[{ei}]: f->GND, t->global[{i_t}], I={elem.current}")
+    diag.add(f"连接到接地节点的元件 ({len(gnd_connections)}):")
+    for gc_line in gnd_connections:
+        diag.add(gc_line)
+
+    solver.setup_ground_node(i_gnd, L, r)
+
+    # ── 10b. 浮空子区域检测与接地 ──
+    diag.section("10b. 浮空子区域检测")
+    voltage_var_count = (len(vindex.global_index_to_vertex_index)
+                         + node_indexer.internal_node_count)
+    n_vars = N - 1  # 排除接地约束行/���
+    _A_adj = L[:n_vars, :n_vars].tocsr()
+    _A_bin = _A_adj.copy()
+    _A_bin.data[:] = 1
+    _A_sym = _A_bin + _A_bin.T
+    _n_comp, _labels = scipy.sparse.csgraph.connected_components(_A_sym, directed=False)
+    diag.add(f"连通分量数: {_n_comp}")
+    if _n_comp > 1:
+        _gnd_comp = _labels[i_gnd]
+        _floating_count = 0
+        for _comp in range(_n_comp):
+            if _comp == _gnd_comp:
+                continue
+            _nodes = np.where(_labels == _comp)[0]
+            if len(_nodes) == 0:
+                continue
+            _node_to_gnd = None
+            for _n in _nodes:
+                if _n < voltage_var_count:
+                    _node_to_gnd = int(_n)
+                    break
+            if _node_to_gnd is None:
+                continue
+            # 使用更强的接地电导 (reg_value * 1e4) 确保 spsolve 不再报奇异
+            _float_gnd_cond = ref_conductance * 1e-2
+            L[_node_to_gnd, _node_to_gnd] += _float_gnd_cond
+            _floating_count += 1
+            diag.add(f"  浮空子区域 {_comp}: 顶点数={len(_nodes)}, "
+                     f"接地节点 global[{_node_to_gnd}], gnd_cond={_float_gnd_cond:.2e}")
+        if _floating_count > 0:
+            log.warning(f"检测到 {_floating_count} 个浮空子区域，已通过微小电导接地")
+    else:
+        diag.add("所有节点均连通到接地节点")
+
+    # ── 11. 求解 ──
+    diag.section("11. 求解")
+    L_csc = L.tocsc()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=scipy.sparse.linalg.MatrixRankWarning)
+        v = scipy.sparse.linalg.spsolve(L_csc, r)
+    solver_used = "spsolve"
+
+    if np.any(np.isnan(v)) or np.any(np.isinf(v)):
+        log.warning("spsolve 返回 NaN/Inf，使用 lsqr 最小二乘求解")
+        result_lsqr = scipy.sparse.linalg.lsqr(L_csc, r, atol=1e-8, btol=1e-8, iter_lim=20000)
+        v = result_lsqr[0]
+        solver_used = "lsqr (spsolve NaN 回退)"
+
+    diag.add(f"求解器: {solver_used}")
+    diag.add(f"解向量范围: [{np.nanmin(v):.6e}, {np.nanmax(v):.6e}]")
+
+    # ── 12. 地电流诊断 ──
+    diag.section("12. 地电流诊断")
+    ground_node_current = v[-1]
+    residual = L_csc @ v - r
+    residual_norm = np.linalg.norm(residual)
+
+    diag.add(f"地电流 ground_node_current = v[-1] = {ground_node_current:.6e} A")
+    diag.add(f"残差 residual_norm = {residual_norm:.6e}")
+    diag.add("")
+
+    # KCL 分析：统计每个连接到 GND 的元件的实际电流
+    diag.add("KCL 电流分析 (流入接地节点的电流):")
+    total_vs_current = 0.0
+    total_cs_current = 0.0
+    for ni, net in enumerate(filtered_networks):
+        for ei, elem in enumerate(net.elements):
+            if isinstance(elem, problem.VoltageSource):
+                i_n = node_indexer.node_to_global_index.get(elem.n)
+                if i_n == i_gnd:
+                    i_v = node_indexer.extra_source_to_global_index.get(elem)
+                    if i_v is not None:
+                        vs_current = v[i_v]
+                        total_vs_current += vs_current
+                        diag.add(f"  VS[{ei}] (V={elem.voltage}): I_vs = v[{i_v}] = {vs_current:.6e} A")
+            if isinstance(elem, problem.CurrentSource):
+                i_f = node_indexer.node_to_global_index.get(elem.f)
+                if i_f == i_gnd:
+                    total_cs_current += elem.current
+                    diag.add(f"  CS[{ei}]: I_load = {elem.current:.6e} A (注入GND)")
+
+    diag.add(f"")
+    diag.add(f"电压源总电流 (流出GND): {total_vs_current:.6e} A")
+    diag.add(f"电流源总电流 (注入GND): {total_cs_current:.6e} A")
+    diag.add(f"KCL 差值: {total_vs_current + total_cs_current:.6e} A (理想=0)")
+    diag.add(f"地电流 v[-1]: {ground_node_current:.6e} A")
+
+    # 正则化泄漏估算
+    if zero_diag > 0:
+        leakage_estimate = 0.0
+        for i in range(len(vindex.global_index_to_vertex_index)):
+            if i < len(v) and abs(v[i]) > 1e-15:
+                # 检查这个顶点是否只靠正则化连接
+                pass
+        diag.add(f"")
+        diag.add(f"正则化影响: {zero_diag} 个零对角线顶点可能泄漏电流")
+        diag.add(f"最大泄漏估算: {zero_diag} * reg_value * max(|v|) = "
+                 f"{zero_diag * reg_value * np.nanmax(np.abs(v)):.6e} A")
+
+    solver_info = solver.SolverInfo(
+        ground_node_current=ground_node_current,
+        residual_norm=residual_norm,
+    )
+
+    log.info("生成求解结果")
+    layer_solutions = solver.produce_layer_solutions(
+        prob.layers, vindex, meshes, mesh_index_to_layer_index,
+        v, disconnected_meshes_by_layer
+    )
+
+    return solver.Solution(problem=prob, layer_solutions=layer_solutions, solver_info=solver_info)
+
+
+# ============================================================
+# FastAPI 应用
+# ============================================================
+
+app = FastAPI(title="padne PDN Analysis API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/test")
+async def health_check():
+    """健康检查"""
+    return {"status": "ok"}
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(request: AnalyzeRequest):
+    """接收 SerializedProblem，求解并返回结果"""
+    try:
+        log.info(f"收到分析请求: project={request.project_name}, "
+                 f"layers={len(request.layers)}, networks={len(request.networks)}, "
+                 f"format_version={request.format_version}")
+
+        diag = DiagnosticsCollector()
+        prob, pre_meshed_data = deserialize_problem(request, diag)
+        pre_meshed_count = len(pre_meshed_data) if pre_meshed_data else 0
+        log.info(f"问题构建完成: {len(prob.layers)} 层, {len(prob.networks)} 网络, 预网格数据: {pre_meshed_count} 个")
+
+        if not prob.layers:
+            return AnalyzeResponse(success=False, message="没有有效的铜层")
+
+        if not prob.networks:
+            return AnalyzeResponse(success=False, message="没有有效的网络")
+
+        # === 预检：估算几何复杂度 ===
+        geom_vertices = _estimate_geometry_vertices(prob)
+        log.info(f"预检: 几何边界顶点 ≈ {geom_vertices}")
+        if geom_vertices > MAX_GEOM_VERTICES:
+            gc.collect()
+            return AnalyzeResponse(
+                success=False,
+                message=f"PCB 几何过于复杂 (估算边界顶点 {geom_vertices} > 上限 {MAX_GEOM_VERTICES})，"
+                        f"请简化铺铜区域或减少分析网络数量"
+            )
+
+        # === 预检：内存检查 ===
+        _check_memory("求解前")
+
+        # 释放反序列化阶段产生的临时对象
+        gc.collect()
+
+        # === 预过滤不可网格层 + 扩展连接点几何 ===
+        prob = _prune_no_mesh_layers(prob)
+        _ensure_connection_geometry(prob, diag)
+        # Option B: 保留远距离连接，让 KDTree 自然映射到最近网格顶点
+        # prob = _prune_far_connections(prob, 5.0, diag)
+
+        # === 连通性诊断 ===
+        connectivity_report = _check_connectivity(prob)
+
+        # === 求解（带超时保护 + 地电流校验重试） ===
+        MAX_SOLVE_RETRIES = 10
+        GROUND_CURRENT_THRESHOLD = 1.0  # A, 正常结果应接近 0
+        pre_solve_diag = diag.result()
+
+        solution = None
+        for attempt in range(MAX_SOLVE_RETRIES):
+            if attempt > 0:
+                diag = DiagnosticsCollector()
+                diag._lines = list(pre_solve_diag)
+
+            solution = _solve_with_timeout(solve_with_pre_meshed, prob, pre_meshed_data or {}, diag)
+            gni = abs(solution.solver_info.ground_node_current)
+            if gni < GROUND_CURRENT_THRESHOLD:
+                if attempt > 0:
+                    log.info(f"求解成功 (第{attempt + 1}次尝试): 地电流={gni:.6e}A")
+                break
+
+        log.info("求解完成")
+
+        result = serialize_solution(solution, generate_images=request.generate_images)
+        result.diagnostics = diag.result()
+
+        # 调试：统计响应数据大小
+        total_verts = sum(len(m.vertices) for ls in result.layer_solutions for m in ls.meshes)
+        total_tris = sum(len(m.triangles) for ls in result.layer_solutions for m in ls.meshes)
+        total_disc_verts = sum(len(m.vertices) for ls in result.layer_solutions for m in ls.disconnected_meshes)
+        resp_json_size = len(result.model_dump_json())
+        log.info(f"响应: success={result.success}, layers={len(result.layer_solutions)}, "
+                 f"images={'yes' if result.images else 'no'}, "
+                 f"mesh_verts={total_verts}, mesh_tris={total_tris}, "
+                 f"disc_verts={total_disc_verts}, "
+                 f"JSON size={resp_json_size / 1024 / 1024:.2f} MB")
+        for i, ls in enumerate(result.layer_solutions):
+            log.info(f"  Layer {i}: name={ls.layer_name}, meshes={len(ls.meshes)}, "
+                     f"disconnected={len(ls.disconnected_meshes)}")
+            for j, m in enumerate(ls.meshes):
+                log.info(f"    Mesh {j}: verts={len(m.vertices)}, tris={len(m.triangles)}, "
+                         f"pots={len(m.potentials)}, pds={len(m.power_densities)}")
+
+        # 连通性诊断仅记录到日志，不再弹窗
+        # if connectivity_report:
+        #     result.message = connectivity_report
+
+        return result
+
+    except MemoryError as e:
+        gc.collect()
+        log.error(f"内存不足: {e}")
+        return AnalyzeResponse(success=False, message=f"内存不足: {str(e)}")
+    except TimeoutError as e:
+        log.error(f"求解超时: {e}")
+        return AnalyzeResponse(success=False, message=f"求解超时: {str(e)}")
+    except KeyError as e:
+        gc.collect()
+        log.warning(f"网络不连通，层{e}无网格数据，生成部分可视化结果")
+        try:
+            partial = _build_partial_solution(prob)
+            result = serialize_solution(partial, generate_images=request.generate_images)
+            result.success = False
+            result.message = "网络不连通，仅显示铜皮几何（无电压/电流数据）。请检查电源网络铺铜是否完整。"
+            return result
+        except Exception as ex:
+            log.warning(f"生成部分结果也失败: {ex}")
+            return AnalyzeResponse(success=False, message="网络不连通，部分电源网络的铺铜不完整或未连接。请检查PCB铺铜是否覆盖所有电源焊盘。")
+    except Exception as e:
+        gc.collect()
+        log.exception("求解失败")
+        return AnalyzeResponse(success=False, message=f"求解失败: {str(e)}")
+
+
+if __name__ == "__main__":
+    import sys
+    import os
+    logging.basicConfig(level=logging.INFO)
+    app_module = "main:app"
+    uvicorn.run(app_module, host="0.0.0.0", port=5000, reload=True)

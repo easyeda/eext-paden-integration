@@ -1,0 +1,52 @@
+{
+	"name": "paden-integration",
+	"uuid": "9b01123fa69e4303a9c3a560ce5bb31b",
+	"displayName": "PADEN仿真",
+	"description": "从 EasyEDA 提取 PCB 数据并进行 PADEN 电源分配网络分析",
+	"version": "1.0.7",
+	"publisher": "",
+	"engines": {
+		"eda": "^3.0.0"
+	},
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "extension-store",
+		"url": ""
+	},
+	"categories": "PCB",
+	"keywords": [
+		"PDN",
+		"Power Analysis",
+		"Simulation"
+	],
+	"images": {
+		"logo": "./images/logo.png"
+	},
+	"homepage": "",
+	"bugs": "",
+	"activationEvents": {
+		"onEditorPcb": true
+	},
+	"entry": "./dist/index",
+	"dependentExtensions": {},
+	"headerMenus": {
+		"pcb": [
+			{
+				"id": "PDN-Analysis",
+				"title": "PADEN 分析",
+				"menuItems": [
+					{
+						"id": "RunPDNAnalysis",
+						"title": "运行 PADEN 分析...",
+						"registerFn": "runPdnAnalysis"
+					},
+					{
+						"id": "About",
+						"title": "关于...",
+						"registerFn": "about"
+					}
+				]
+			}
+		]
+	}
+}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -i \"\\\\.md$\")",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(xxd)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('paden-service/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}

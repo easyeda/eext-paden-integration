@@ -1,0 +1,1477 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>PDN 分析结果</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  .toolbar { height: 36px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; padding: 0 8px; gap: 6px; flex-shrink: 0; }
+  .toolbar select { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
+  .toolbar button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer; }
+  .toolbar button:hover { background: #30363d; }
+  .toolbar button.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .toolbar .sep { width: 1px; height: 20px; background: #30363d; margin: 0 4px; }
+  .toolbar .spacer { flex: 1; }
+  .toolbar .btn-close { background: #da3633; border-color: #da3633; color: #fff; }
+  .toolbar .btn-close:hover { background: #f85149; }
+
+  .diag-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 200; display: flex; align-items: center; justify-content: center; }
+  .diag-modal { background: #161b22; border: 1px solid #30363d; border-radius: 8px; width: 720px; max-height: 80vh; display: flex; flex-direction: column; }
+  .diag-header { padding: 12px 16px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 8px; }
+  .diag-header h3 { flex: 1; font-size: 14px; color: #f0f6fc; }
+  .diag-header button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 4px 12px; font-size: 11px; cursor: pointer; }
+  .diag-header button:hover { background: #30363d; }
+  .diag-body { flex: 1; overflow-y: auto; padding: 12px 16px; font-family: 'Consolas', 'Monaco', monospace; font-size: 11.5px; line-height: 1.7; color: #c9d1d9; white-space: pre-wrap; word-break: break-all; }
+  .diag-body .diag-section { color: #58a6ff; font-weight: 700; margin-top: 8px; }
+  .diag-body .diag-warn { color: #f0883e; }
+  .diag-body .diag-ok { color: #3fb950; }
+  .diag-body .diag-bad { color: #f85149; }
+  .info-panel .diag-link { color: #58a6ff; cursor: pointer; text-decoration: underline; pointer-events: auto; }
+
+  .layer-sidebar { width: 170px; background: #161b22; border-right: 1px solid #30363d; display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
+  .sidebar-header { padding: 8px 10px; font-size: 12px; font-weight: 600; color: #8b949e; border-bottom: 1px solid #30363d; text-transform: uppercase; letter-spacing: 0.5px; }
+  .sidebar-layers { flex: 1; overflow-y: auto; padding: 4px 0; }
+  .sidebar-layers::-webkit-scrollbar { width: 5px; }
+  .sidebar-layers::-webkit-scrollbar-track { background: transparent; }
+  .sidebar-layers::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+  .layer-item { display: flex; align-items: center; padding: 4px 8px; gap: 6px; cursor: pointer; transition: background 0.15s; }
+  .layer-item:hover { background: #21262d; }
+  .layer-item.active { background: #1c2536; }
+  .layer-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .layer-name { flex: 1; font-size: 11px; color: #c9d1d9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .layer-item.active .layer-name { color: #f0f6fc; font-weight: 600; }
+  .layer-eye { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border: none; background: transparent; color: #8b949e; cursor: pointer; border-radius: 3px; font-size: 13px; flex-shrink: 0; }
+  .layer-eye:hover { background: #30363d; color: #e6edf3; }
+  .layer-eye.hidden { color: #484f58; }
+  .sidebar-actions { padding: 6px 8px; border-top: 1px solid #30363d; display: flex; gap: 4px; }
+  .sidebar-actions button { flex: 1; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 3px; padding: 3px 0; font-size: 10px; cursor: pointer; }
+  .sidebar-actions button:hover { background: #30363d; color: #e6edf3; }
+
+  .main-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .canvas-wrap { flex: 1; position: relative; overflow: hidden; }
+  #gl-canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+
+  .colorbar { position: absolute; right: 16px; top: 50%; transform: translateY(-50%); display: flex; gap: 4px; align-items: stretch; pointer-events: none; }
+  .colorbar canvas { border: 1px solid #30363d; border-radius: 3px; }
+  .cb-labels { display: flex; flex-direction: column; justify-content: space-between; font-size: 10px; font-family: monospace; color: #8b949e; padding: 2px 0; }
+
+  .info-panel { position: absolute; left: 12px; bottom: 12px; background: rgba(13,17,23,0.88); border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 11px; font-family: monospace; line-height: 1.6; color: #c9d1d9; pointer-events: none; max-width: 280px; }
+  .info-panel .label { color: #8b949e; }
+  .info-panel .value { color: #f0f6fc; font-weight: 600; }
+  .info-panel .warn { color: #f0883e; }
+
+  .tooltip { position: absolute; background: rgba(13,17,23,0.92); border: 1px solid #30363d; border-radius: 4px; padding: 5px 9px; font-size: 11px; font-family: monospace; color: #c9d1d9; pointer-events: none; white-space: nowrap; line-height: 1.5; z-index: 10; }
+
+  .statusbar { height: 26px; background: #161b22; border-top: 1px solid #30363d; display: flex; align-items: center; padding: 0 12px; gap: 20px; font-size: 11px; font-family: monospace; color: #8b949e; flex-shrink: 0; }
+  .statusbar span { white-space: nowrap; }
+
+  .loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #484f58; font-size: 14px; }
+  .view-tab { padding: 3px 12px; border: 1px solid #ccc; border-radius: 3px; background: #fff; cursor: pointer; font-size: 11px; }
+  .view-tab:hover { background: #e8e8e8; }
+  .view-tab.active { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+</style>
+</head>
+<body>
+
+<div class="toolbar" id="toolbar">
+  <select id="cmap-select" title="色彩映射"><option value="plasma">Plasma</option><option value="turbo">Turbo</option><option value="inferno">Inferno</option></select>
+  <div class="sep"></div>
+  <button id="btn-edges" class="active" title="网格线 (E)">网格</button>
+  <button id="btn-outline" class="active" title="轮廓 (O)">轮廓</button>
+  <button id="btn-vias" class="active" title="过孔 (C)">过孔</button>
+  <button id="btn-ctx-tracks" class="active" title="非电源走线 (T)">走线</button>
+  <button id="btn-pads" class="active" title="焊盘 (D)">焊盘</button>
+  <button id="btn-viewmode" title="切换电压/功率密度 (P)">功率密度</button>
+  <div class="sep"></div>
+  <button id="btn-reset" title="重置视图 (R)">重置</button>
+  <span class="spacer"></span>
+  <button id="btn-reanalyze" style="background:#238636;border-color:#238636;color:#fff" onclick="reanalyze()">重新分析</button>
+  <button class="btn-close" onclick="closeWindow()">关闭</button>
+</div>
+
+<div style="flex:1;display:flex;overflow:hidden">
+<div class="layer-sidebar" id="layer-sidebar">
+  <div class="sidebar-header">图层</div>
+  <div class="sidebar-layers" id="sidebar-layers"></div>
+  <div class="sidebar-actions">
+    <button onclick="showAllLayers()">全部显示</button>
+    <button onclick="hideAllLayers()">全部隐藏</button>
+  </div>
+</div>
+<div class="main-area">
+<div class="canvas-wrap">
+  <canvas id="gl-canvas"></canvas>
+  <div class="colorbar" id="colorbar" style="display:none">
+    <canvas id="cb-canvas" width="18" height="256"></canvas>
+    <div class="cb-labels"><span id="cb-max">-</span><span id="cb-min">-</span></div>
+  </div>
+  <div class="info-panel" id="info-panel" style="display:none"></div>
+  <div class="tooltip" id="tooltip" style="display:none"></div>
+  <div class="loading" id="loading">等待分析结果...</div>
+</div>
+</div>
+</div>
+
+<div class="statusbar">
+  <span id="st-layer">层: --</span>
+  <span id="st-pos">X: --  Y: --</span>
+  <span id="st-voltage">电压: --</span>
+  <span id="st-delta">Δ: --</span>
+</div>
+<div id="warning-banner" style="display:none;position:fixed;bottom:28px;left:0;right:0;background:#da3633;color:#fff;padding:4px 12px;font-size:12px;text-align:center;z-index:100"></div>
+
+<script>
+// ============================================================
+// PLASMA colormap (from matplotlib, 256 samples)
+// ============================================================
+const PLASMA=[
+[0.050383,0.029803,0.527975],[0.063536,0.028426,0.533124],[0.075353,0.027206,0.538007],
+[0.086222,0.026125,0.542658],[0.096379,0.025165,0.547103],[0.10598,0.024309,0.551368],
+[0.115124,0.023556,0.555468],[0.123903,0.022878,0.559423],[0.132381,0.022258,0.56325],
+[0.140603,0.021687,0.566959],[0.148607,0.021154,0.570562],[0.156421,0.020651,0.574065],
+[0.16407,0.020171,0.577478],[0.171574,0.019706,0.580806],[0.17895,0.019252,0.584054],
+[0.186213,0.018803,0.587228],[0.193374,0.018354,0.59033],[0.200445,0.017902,0.593364],
+[0.207435,0.017442,0.596333],[0.21435,0.016973,0.599239],[0.221197,0.016497,0.602083],
+[0.227983,0.016007,0.604867],[0.234715,0.015502,0.607592],[0.241396,0.014979,0.610259],
+[0.248032,0.014439,0.612868],[0.254627,0.013882,0.615419],[0.261183,0.013308,0.617911],
+[0.267703,0.012716,0.620346],[0.274191,0.012109,0.622722],[0.280648,0.011488,0.625038],
+[0.287076,0.010855,0.627295],[0.293478,0.010213,0.62949],[0.299855,0.009561,0.631624],
+[0.30621,0.008902,0.633694],[0.312543,0.008239,0.6357],[0.318856,0.007576,0.63764],
+[0.32515,0.006915,0.639512],[0.331426,0.006261,0.641316],[0.337683,0.005618,0.643049],
+[0.343925,0.004991,0.64471],[0.35015,0.004382,0.646298],[0.356359,0.003798,0.64781],
+[0.362553,0.003243,0.649245],[0.368733,0.002724,0.650601],[0.374897,0.002245,0.651876],
+[0.381047,0.001814,0.653068],[0.387183,0.001434,0.654177],[0.393304,0.001114,0.655199],
+[0.399411,0.000859,0.656133],[0.405503,0.000678,0.656977],[0.41158,0.000577,0.65773],
+[0.417642,0.000564,0.65839],[0.423689,0.000646,0.658956],[0.429719,0.000831,0.659425],
+[0.435734,0.001127,0.659797],[0.441732,0.00154,0.660069],[0.447714,0.00208,0.66024],
+[0.453677,0.002755,0.66031],[0.459623,0.003574,0.660277],[0.46555,0.004545,0.660139],
+[0.471457,0.005678,0.659897],[0.477344,0.00698,0.659549],[0.48321,0.00846,0.659095],
+[0.489055,0.010127,0.658534],[0.494877,0.01199,0.657865],[0.500678,0.014055,0.657088],
+[0.506454,0.016333,0.656202],[0.512206,0.018833,0.655209],[0.517933,0.021563,0.654109],
+[0.523633,0.024532,0.652901],[0.529306,0.027747,0.651586],[0.534952,0.031217,0.650165],
+[0.54057,0.03495,0.64864],[0.546157,0.038954,0.64701],[0.551715,0.043136,0.645277],
+[0.557243,0.047331,0.643443],[0.562738,0.051545,0.641509],[0.568201,0.055778,0.639477],
+[0.573632,0.060028,0.637349],[0.579029,0.064296,0.635126],[0.584391,0.068579,0.632812],
+[0.589719,0.072878,0.630408],[0.595011,0.07719,0.627917],[0.600266,0.081516,0.625342],
+[0.605485,0.085854,0.622686],[0.610667,0.090204,0.619951],[0.615812,0.094564,0.61714],
+[0.620919,0.098934,0.614257],[0.625987,0.103312,0.611305],[0.631017,0.107699,0.608287],
+[0.636008,0.112092,0.605205],[0.640959,0.116492,0.602065],[0.645872,0.120898,0.598867],
+[0.650746,0.125309,0.595617],[0.65558,0.129725,0.592317],[0.660374,0.134144,0.588971],
+[0.665129,0.138566,0.585582],[0.669845,0.142992,0.582154],[0.674522,0.147419,0.578688],
+[0.67916,0.151848,0.575189],[0.683758,0.156278,0.57166],[0.688318,0.160709,0.568103],
+[0.69284,0.165141,0.564522],[0.697324,0.169573,0.560919],[0.701769,0.174005,0.557296],
+[0.706178,0.178437,0.553657],[0.710549,0.182868,0.550004],[0.714883,0.187299,0.546338],
+[0.719181,0.191729,0.542663],[0.723444,0.196158,0.538981],[0.72767,0.200586,0.535293],
+[0.731862,0.205013,0.531601],[0.736019,0.209439,0.527908],[0.740143,0.213864,0.524216],
+[0.744232,0.218288,0.520524],[0.748289,0.222711,0.516834],[0.752312,0.227133,0.513149],
+[0.756304,0.231555,0.509468],[0.760264,0.235976,0.505794],[0.764193,0.240396,0.502126],
+[0.76809,0.244817,0.498465],[0.771958,0.249237,0.494813],[0.775796,0.253658,0.491171],
+[0.779604,0.258078,0.487539],[0.783383,0.2625,0.483918],[0.787133,0.266922,0.480307],
+[0.790855,0.271345,0.476706],[0.794549,0.27577,0.473117],[0.798216,0.280197,0.469538],
+[0.801855,0.284626,0.465971],[0.805467,0.289057,0.462415],[0.809052,0.293491,0.45887],
+[0.812612,0.297928,0.455338],[0.816144,0.302368,0.451816],[0.819651,0.306812,0.448306],
+[0.823132,0.311261,0.444806],[0.826588,0.315714,0.441316],[0.830018,0.320172,0.437836],
+[0.833422,0.324635,0.434366],[0.836801,0.329105,0.430905],[0.840155,0.33358,0.427455],
+[0.843484,0.338062,0.424013],[0.846788,0.342551,0.420579],[0.850066,0.347048,0.417153],
+[0.853319,0.351553,0.413734],[0.856547,0.356066,0.410322],[0.85975,0.360588,0.406917],
+[0.862927,0.365119,0.403519],[0.866078,0.36966,0.400126],[0.869203,0.374212,0.396738],
+[0.872303,0.378774,0.393355],[0.875376,0.383347,0.389976],[0.878423,0.387932,0.3866],
+[0.881443,0.392529,0.383229],[0.884436,0.397139,0.37986],[0.887402,0.401762,0.376494],
+[0.89034,0.406398,0.37313],[0.89325,0.411048,0.369768],[0.896131,0.415712,0.366407],
+[0.898984,0.420392,0.363047],[0.901807,0.425087,0.359688],[0.904601,0.429797,0.356329],
+[0.907365,0.434524,0.35297],[0.910098,0.439268,0.34961],[0.9128,0.444029,0.346251],
+[0.915471,0.448807,0.34289],[0.918109,0.453603,0.339529],[0.920714,0.458417,0.336166],
+[0.923287,0.463251,0.332801],[0.925825,0.468103,0.329435],[0.928329,0.472975,0.326067],
+[0.930798,0.477867,0.322697],[0.933232,0.48278,0.319325],[0.93563,0.487712,0.315952],
+[0.93799,0.492667,0.312575],[0.940313,0.497642,0.309197],[0.942598,0.502639,0.305816],
+[0.944844,0.507658,0.302433],[0.947051,0.512699,0.299049],[0.949217,0.517763,0.295662],
+[0.951344,0.52285,0.292275],[0.953428,0.52796,0.288883],[0.95547,0.533093,0.28549],
+[0.957469,0.53825,0.282096],[0.959424,0.543431,0.278701],[0.961336,0.548636,0.275305],
+[0.963203,0.553865,0.271909],[0.965024,0.559118,0.268513],[0.966798,0.564396,0.265118],
+[0.968526,0.5697,0.261721],[0.970205,0.575028,0.258325],[0.971835,0.580382,0.254931],
+[0.973416,0.585761,0.25154],[0.974947,0.591165,0.248151],[0.976428,0.596595,0.244767],
+[0.977856,0.602051,0.241387],[0.979233,0.607532,0.238013],[0.980556,0.613039,0.234646],
+[0.981826,0.618572,0.231287],[0.983041,0.624131,0.227937],[0.984199,0.629718,0.224595],
+[0.985301,0.63533,0.221265],[0.986345,0.640969,0.217948],[0.987332,0.646633,0.214648],
+[0.98826,0.652325,0.211364],[0.989128,0.658043,0.2081],[0.989935,0.663787,0.204859],
+[0.990681,0.669558,0.201642],[0.991365,0.675355,0.198453],[0.991985,0.681179,0.195295],
+[0.992541,0.68703,0.19217],[0.993032,0.692907,0.189084],[0.993456,0.69881,0.186041],
+[0.993814,0.704741,0.183043],[0.994103,0.710698,0.180097],[0.994324,0.716681,0.177208],
+[0.994474,0.722691,0.174381],[0.994553,0.728728,0.171622],[0.994561,0.734791,0.168938],
+[0.994495,0.74088,0.166335],[0.994355,0.746995,0.163821],[0.994141,0.753137,0.161404],
+[0.993851,0.759304,0.159092],[0.993482,0.765499,0.156891],[0.993033,0.77172,0.154808],
+[0.992505,0.777967,0.152855],[0.991897,0.784239,0.151042],[0.991209,0.790537,0.149377],
+[0.990439,0.796859,0.14787],[0.989587,0.803205,0.146529],[0.988648,0.809579,0.145357],
+[0.987621,0.815978,0.144363],[0.986509,0.822401,0.143557],[0.985314,0.828846,0.142945],
+[0.984031,0.835315,0.142528],[0.982653,0.841812,0.142303],[0.98119,0.848329,0.142279],
+[0.979644,0.854866,0.142453],[0.977995,0.861432,0.142808],[0.976265,0.868016,0.143351],
+[0.974443,0.874622,0.144061],[0.97253,0.88125,0.144923],[0.970533,0.887896,0.145919],
+[0.968443,0.894564,0.147014],[0.966271,0.901249,0.14818],[0.964021,0.90795,0.14937],
+[0.961681,0.914672,0.15052],[0.959276,0.921407,0.151566],[0.956808,0.928152,0.152409],
+[0.954287,0.934908,0.152921],[0.951726,0.941671,0.152925],[0.949151,0.948435,0.152178],
+[0.946602,0.95519,0.150328],[0.944152,0.961916,0.146861],[0.941896,0.96859,0.140956],
+[0.940015,0.975158,0.131326]
+];
+
+const TURBO=[];
+const INFERNO=[];
+(function(){
+// Turbo: perceptually uniform, vibrant
+const TK=[[0.18995,0.07176,0.23217],[0.19453,0.08360,0.26149],[0.19898,0.09547,0.29020],[0.20331,0.10738,0.31826],[0.20753,0.11932,0.34564],[0.21163,0.13129,0.37232],[0.21562,0.14330,0.39823],[0.21950,0.15533,0.42335],[0.22328,0.16739,0.44767],[0.22695,0.17947,0.47118],[0.23051,0.19158,0.49388],[0.23397,0.20371,0.51576],[0.23733,0.21587,0.53682],[0.24059,0.22804,0.55705],[0.24374,0.24024,0.57644],[0.24680,0.25245,0.59500],[0.24977,0.26469,0.61272],[0.25264,0.27694,0.62960],[0.25542,0.28921,0.64565],[0.25811,0.30149,0.66086],[0.26072,0.31379,0.67525],[0.26324,0.32610,0.68881],[0.26568,0.33843,0.70154],[0.26805,0.35077,0.71346],[0.27033,0.36312,0.72456],[0.27254,0.37548,0.73486],[0.27469,0.38785,0.74435],[0.27677,0.40023,0.75304],[0.27878,0.41262,0.76094],[0.28073,0.42501,0.76805],[0.28262,0.43741,0.77438],[0.28445,0.44981,0.77993],[0.28623,0.46221,0.78471],[0.28795,0.47461,0.78873],[0.28962,0.48701,0.79199],[0.29124,0.49940,0.79450],[0.29281,0.51179,0.79627],[0.29434,0.52417,0.79730],[0.29582,0.53655,0.79761],[0.29726,0.54892,0.79720],[0.29865,0.56128,0.79608],[0.30001,0.57363,0.79427],[0.30133,0.58597,0.79177],[0.30261,0.59829,0.78859],[0.30386,0.61060,0.78474],[0.30507,0.62289,0.78023],[0.30625,0.63517,0.77507],[0.30740,0.64742,0.76927],[0.30852,0.65966,0.76283],[0.30961,0.67187,0.75577],[0.31067,0.68406,0.74810],[0.31170,0.69623,0.73983],[0.31271,0.70837,0.73097],[0.31369,0.72048,0.72153],[0.31465,0.73257,0.71152],[0.31558,0.74463,0.70095],[0.31649,0.75666,0.68984],[0.31738,0.76866,0.67820],[0.31824,0.78063,0.66603],[0.31909,0.79257,0.65336],[0.31991,0.80447,0.64019],[0.32072,0.81634,0.62654],[0.32150,0.82817,0.61242],[0.32227,0.83997,0.59784],[0.32301,0.85173,0.58281],[0.32374,0.86344,0.56734],[0.32445,0.87512,0.55146],[0.32514,0.88675,0.53518],[0.32582,0.89833,0.51851],[0.32648,0.90987,0.50147],[0.32712,0.92135,0.48408],[0.32775,0.93279,0.46635],[0.32836,0.94418,0.44830],[0.32896,0.95551,0.42995],[0.32954,0.96679,0.41132],[0.33011,0.97802,0.39242],[0.33066,0.98919,0.37328],[0.33120,1.00000,0.35390],[0.33173,0.99854,0.33434],[0.33225,0.98728,0.31464],[0.33277,0.97602,0.29484],[0.33328,0.96477,0.27497],[0.33378,0.95353,0.25506],[0.33428,0.94230,0.23513],[0.33477,0.93109,0.21522],[0.33525,0.91990,0.19536],[0.33573,0.90873,0.17557],[0.33620,0.89759,0.15589],[0.33667,0.88647,0.13634],[0.33713,0.87539,0.11696],[0.33758,0.86434,0.09779],[0.33803,0.85333,0.07885],[0.33847,0.84236,0.06019],[0.33891,0.83143,0.04183],[0.33934,0.82055,0.02381],[0.33977,0.80971,0.00616],[0.34019,0.79893,-0.01110],[0.34061,0.78820,-0.02793],[0.34102,0.77753,-0.04430],[0.34143,0.76692,-0.06019],[0.34183,0.75637,-0.07558],[0.34223,0.74589,-0.09045],[0.34262,0.73548,-0.10478],[0.34301,0.72514,-0.11854],[0.34339,0.71488,-0.13172],[0.34377,0.70469,-0.14430],[0.34415,0.69459,-0.15626],[0.34452,0.68457,-0.16758],[0.34489,0.67463,-0.17826],[0.34525,0.66478,-0.18827],[0.34561,0.65503,-0.19760],[0.34597,0.64537,-0.20623],[0.34632,0.63581,-0.21416],[0.34666,0.62635,-0.22137],[0.34700,0.61700,-0.22784],[0.34734,0.60775,-0.23357],[0.34767,0.59861,-0.23854],[0.34800,0.58958,-0.24275],[0.34832,0.58066,-0.24618],[0.34864,0.57185,-0.24883],[0.34896,0.56316,-0.25069],[0.34927,0.55459,-0.25176],[0.34957,0.54614,-0.25203],[0.34988,0.53782,-0.25151],[0.35017,0.52962,-0.25018],[0.35047,0.52155,-0.24806],[0.35076,0.51360,-0.24514],[0.35104,0.50579,-0.24143],[0.35132,0.49811,-0.23692],[0.35160,0.49056,-0.23163],[0.35187,0.48315,-0.22556],[0.35214,0.47587,-0.21871],[0.35240,0.46873,-0.21110],[0.35266,0.46173,-0.20272],[0.35292,0.45486,-0.19359],[0.35317,0.44814,-0.18372],[0.35342,0.44155,-0.17312],[0.35366,0.43511,-0.16180],[0.35390,0.42882,-0.14977],[0.35413,0.42266,-0.13706],[0.35436,0.41666,-0.12367],[0.35458,0.41080,-0.10962],[0.35480,0.40508,-0.09493],[0.35502,0.39952,-0.07962],[0.35523,0.39410,-0.06371],[0.35543,0.38883,-0.04722],[0.35563,0.38371,-0.03017],[0.35583,0.37874,-0.01258],[0.35602,0.37392,0.00553],[0.35621,0.36925,0.02415],[0.35639,0.36472,0.04327],[0.35656,0.36034,0.06287],[0.35673,0.35611,0.08295],[0.35690,0.35202,0.10349],[0.35706,0.34808,0.12449],[0.35721,0.34428,0.14593],[0.35736,0.34063,0.16779],[0.35750,0.33711,0.19007],[0.35764,0.33373,0.21274],[0.35777,0.33050,0.23580],[0.35790,0.32740,0.25922],[0.35802,0.32443,0.28300],[0.35813,0.32159,0.30712],[0.35824,0.31888,0.33155],[0.35835,0.31630,0.35629],[0.35844,0.31384,0.38131],[0.35853,0.31150,0.40661],[0.35862,0.30927,0.43216],[0.35869,0.30716,0.45794],[0.35876,0.30516,0.48393],[0.35882,0.30326,0.51012],[0.35888,0.30147,0.53649],[0.35893,0.29977,0.56303],[0.35897,0.29817,0.58972],[0.35900,0.29666,0.61655],[0.35903,0.29524,0.64349],[0.35905,0.29390,0.67055],[0.35906,0.29264,0.69769],[0.35907,0.29145,0.72491],[0.35907,0.29034,0.75219],[0.35906,0.28929,0.77952],[0.35904,0.28831,0.80687],[0.35901,0.28738,0.83424],[0.35897,0.28651,0.86161],[0.35893,0.28568,0.88897],[0.35887,0.28489,0.91631],[0.35880,0.28414,0.94362],[0.35873,0.28342,0.97088]];
+for(const c of TK)TURBO.push(c);
+// Inferno: dark, high contrast
+const IK=[[0.001462,0.000466,0.013866],[0.002267,0.001270,0.018570],[0.003279,0.002249,0.024239],[0.004512,0.003392,0.030909],[0.005950,0.004692,0.038558],[0.007588,0.006140,0.046836],[0.009426,0.007713,0.055143],[0.011465,0.009417,0.063460],[0.013708,0.011224,0.071862],[0.016156,0.013136,0.080282],[0.018815,0.015133,0.088767],[0.021692,0.017199,0.097327],[0.024792,0.019331,0.105930],[0.028123,0.021503,0.114621],[0.031696,0.023702,0.123397],[0.035520,0.025921,0.132232],[0.039608,0.028139,0.141141],[0.043830,0.030324,0.150164],[0.048062,0.032474,0.159254],[0.052320,0.034569,0.168414],[0.056615,0.036590,0.177642],[0.060949,0.038522,0.186962],[0.065330,0.040346,0.196354],[0.069764,0.042045,0.205799],[0.074257,0.043601,0.215289],[0.078815,0.044999,0.224822],[0.083446,0.046223,0.234414],[0.088155,0.047261,0.244060],[0.092949,0.048099,0.253758],[0.097833,0.048726,0.263507],[0.102815,0.049130,0.273296],[0.107899,0.049301,0.283126],[0.113094,0.049230,0.293000],[0.118406,0.048906,0.302909],[0.123833,0.048324,0.312854],[0.129380,0.047474,0.322832],[0.135053,0.046353,0.332827],[0.140858,0.044947,0.342845],[0.146785,0.043268,0.352884],[0.152839,0.041307,0.362930],[0.159018,0.039068,0.372975],[0.165308,0.036573,0.382998],[0.171713,0.033824,0.393000],[0.178212,0.030863,0.402958],[0.184801,0.027707,0.412869],[0.191460,0.024393,0.422713],[0.198177,0.020953,0.432473],[0.204935,0.017433,0.442143],[0.211718,0.013883,0.451715],[0.218512,0.010361,0.461172],[0.225302,0.006932,0.470503],[0.232077,0.003671,0.479685],[0.238826,0.000652,0.488708],[0.245543,-0.002139,0.497546],[0.252220,-0.004676,0.506189],[0.258857,-0.006961,0.514619],[0.265447,-0.008990,0.522813],[0.271987,-0.010782,0.530759],[0.278474,-0.012353,0.538451],[0.284903,-0.013720,0.545886],[0.291271,-0.014902,0.553055],[0.297574,-0.015916,0.559953],[0.303809,-0.016778,0.566584],[0.309983,-0.017495,0.572945],[0.316094,-0.018083,0.579030],[0.322139,-0.018554,0.584841],[0.328119,-0.018918,0.590379],[0.334032,-0.019186,0.595641],[0.339877,-0.019367,0.600630],[0.345652,-0.019470,0.605347],[0.351355,-0.019502,0.609794],[0.356984,-0.019470,0.613976],[0.362539,-0.019380,0.617893],[0.368018,-0.019239,0.621549],[0.373420,-0.019051,0.624948],[0.378744,-0.018822,0.628092],[0.383991,-0.018556,0.630984],[0.389159,-0.018258,0.633628],[0.394249,-0.017932,0.636027],[0.399260,-0.017582,0.638185],[0.404193,-0.017211,0.640105],[0.409048,-0.016823,0.641792],[0.413825,-0.016420,0.643249],[0.418525,-0.016006,0.644481],[0.423148,-0.015582,0.645492],[0.427694,-0.015152,0.646286],[0.432163,-0.014717,0.646867],[0.436556,-0.014280,0.647240],[0.440874,-0.013842,0.647409],[0.445118,-0.013406,0.647378],[0.449288,-0.012972,0.647152],[0.453386,-0.012543,0.646734],[0.457411,-0.012119,0.646130],[0.461364,-0.011702,0.645343],[0.465246,-0.011293,0.644378],[0.469058,-0.010893,0.643240],[0.472800,-0.010503,0.641931],[0.476474,-0.010124,0.640456],[0.480079,-0.009756,0.638819],[0.483618,-0.009400,0.637025],[0.487090,-0.009056,0.635077],[0.490497,-0.008724,0.632979],[0.493840,-0.008405,0.630735],[0.497119,-0.008100,0.628349],[0.500337,-0.007808,0.625826],[0.503494,-0.007530,0.623170],[0.506591,-0.007266,0.620384],[0.509630,-0.007017,0.617471],[0.512612,-0.006781,0.614436],[0.515537,-0.006560,0.611282],[0.518407,-0.006353,0.608012],[0.521223,-0.006160,0.604630],[0.523986,-0.005981,0.601139],[0.526697,-0.005815,0.597543],[0.529358,-0.005663,0.593844],[0.531969,-0.005525,0.590047],[0.534533,-0.005400,0.586155],[0.537049,-0.005287,0.582172],[0.539520,-0.005188,0.578101],[0.541946,-0.005100,0.573945],[0.544329,-0.005024,0.569707],[0.546670,-0.004960,0.565390],[0.548969,-0.004907,0.560998],[0.551228,-0.004864,0.556533],[0.553449,-0.004832,0.551999],[0.555631,-0.004810,0.547397],[0.557777,-0.004797,0.542732],[0.559887,-0.004793,0.538005],[0.561962,-0.004797,0.533220],[0.564003,-0.004809,0.528379],[0.566011,-0.004828,0.523484],[0.567986,-0.004854,0.518538],[0.569930,-0.004887,0.513543],[0.571844,-0.004925,0.508502],[0.573727,-0.004970,0.503415],[0.575581,-0.005019,0.498287],[0.577406,-0.005073,0.493119],[0.579203,-0.005132,0.487914],[0.580971,-0.005194,0.482674],[0.582713,-0.005261,0.477401],[0.584427,-0.005332,0.472096],[0.586115,-0.005406,0.466762],[0.587777,-0.005483,0.461401],[0.589413,-0.005564,0.456014],[0.591024,-0.005647,0.450604],[0.592611,-0.005733,0.445172],[0.594173,-0.005822,0.439720],[0.595712,-0.005912,0.434248],[0.597227,-0.006005,0.428759],[0.598720,-0.006099,0.423254],[0.600190,-0.006195,0.417734],[0.601639,-0.006292,0.412200],[0.603067,-0.006391,0.406654],[0.604474,-0.006490,0.401097],[0.605861,-0.006590,0.395530],[0.607228,-0.006690,0.389954],[0.608576,-0.006791,0.384370],[0.609906,-0.006891,0.378779],[0.611217,-0.006991,0.373183],[0.612510,-0.007090,0.367581],[0.613786,-0.007188,0.361976],[0.615044,-0.007285,0.356368],[0.616286,-0.007381,0.350758],[0.617510,-0.007474,0.345147],[0.618718,-0.007566,0.339537],[0.619910,-0.007655,0.333927],[0.621085,-0.007741,0.328319],[0.622245,-0.007824,0.322713],[0.623390,-0.007904,0.317110],[0.624519,-0.007981,0.311511],[0.625634,-0.008054,0.305916],[0.626734,-0.008123,0.300326],[0.627820,-0.008189,0.294741],[0.628892,-0.008250,0.289162],[0.629950,-0.008308,0.283589],[0.630995,-0.008361,0.278022],[0.632027,-0.008410,0.272463],[0.633046,-0.008455,0.266912],[0.634052,-0.008495,0.261369],[0.635047,-0.008530,0.255835],[0.636029,-0.008561,0.250310],[0.636999,-0.008586,0.244795],[0.637958,-0.008607,0.239290],[0.638906,-0.008622,0.233796],[0.639842,-0.008632,0.228312],[0.640768,-0.008637,0.222840],[0.641683,-0.008636,0.217379],[0.642587,-0.008630,0.211931],[0.643481,-0.008618,0.206495],[0.644365,-0.008601,0.201072],[0.645239,-0.008578,0.195663],[0.646103,-0.008549,0.190267],[0.646957,-0.008514,0.184885],[0.647802,-0.008473,0.179518],[0.648637,-0.008425,0.174165],[0.649463,-0.008371,0.168827],[0.650279,-0.008310,0.163504],[0.651087,-0.008243,0.158196],[0.651886,-0.008169,0.152904],[0.652676,-0.008088,0.147627],[0.653457,-0.008001,0.142367],[0.654230,-0.007906,0.137122],[0.654995,-0.007804,0.131893],[0.655751,-0.007695,0.126681],[0.656499,-0.007578,0.121485],[0.657239,-0.007454,0.116306],[0.657971,-0.007322,0.111144],[0.658695,-0.007183,0.105999],[0.659411,-0.007035,0.100872],[0.660119,-0.006880,0.095762],[0.660819,-0.006716,0.090670],[0.661511,-0.006544,0.085596],[0.662196,-0.006364,0.080540],[0.662873,-0.006175,0.075503],[0.663543,-0.005978,0.070484],[0.664205,-0.005772,0.065485],[0.664860,-0.005558,0.060504],[0.665508,-0.005335,0.055543],[0.666149,-0.005103,0.050602],[0.666783,-0.004862,0.045680],[0.667409,-0.004613,0.040778],[0.668029,-0.004354,0.035896],[0.668642,-0.004087,0.031034],[0.669248,-0.003810,0.026192],[0.669847,-0.003525,0.021371],[0.670440,-0.003230,0.016569],[0.671026,-0.002927,0.011789],[0.671605,-0.002614,0.007028],[0.672178,-0.002292,0.002289]];
+for(const c of IK)INFERNO.push(c);
+})();
+
+const CMAPS = { plasma: PLASMA, turbo: TURBO, inferno: INFERNO };
+let currentCmap = 'plasma';
+
+// ============================================================
+// Shader sources
+// ============================================================
+const VS_MESH = `
+attribute vec2 a_pos;
+attribute float a_val;
+uniform mat4 u_mvp;
+varying float v_t;
+void main(){
+  gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);
+  v_t = a_val;
+}`;
+
+const FS_MESH = `
+precision highp float;
+varying float v_t;
+uniform sampler2D u_cmap;
+uniform float u_alpha;
+void main(){
+  vec4 color = texture2D(u_cmap, vec2(v_t, 0.5));
+  gl_FragColor = vec4(color.rgb, color.a * u_alpha);
+}`;
+
+const VS_LINE = `
+attribute vec2 a_pos;
+uniform mat4 u_mvp;
+void main(){
+  gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);
+}`;
+
+const FS_LINE = `
+precision mediump float;
+uniform vec4 u_color;
+void main(){
+  gl_FragColor = u_color;
+}`;
+
+const VS_POINT = `
+attribute vec2 a_pos;
+attribute vec3 a_col;
+uniform mat4 u_mvp;
+uniform float u_size;
+varying vec3 v_col;
+void main(){
+  gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);
+  gl_PointSize = u_size;
+  v_col = a_col;
+}`;
+
+const FS_POINT = `
+precision mediump float;
+varying vec3 v_col;
+void main(){
+  vec2 d = gl_PointCoord - vec2(0.5);
+  float r = length(d);
+  if(r > 0.5) discard;
+  float border = smoothstep(0.35, 0.42, r);
+  vec3 c = mix(v_col, vec3(0.05), border);
+  float hole = 1.0 - smoothstep(0.15, 0.22, r);
+  c = mix(c, vec3(0.04), hole);
+  gl_FragColor = vec4(c, 1.0);
+}`;
+
+// ============================================================
+// Globals
+// ============================================================
+let gl, canvas;
+let meshProg, lineProg, pointProg;
+let cmapTex;
+let ext32bit;
+
+let resultData, layerNames, connectionPoints, layerBoundaries, pcbContext;
+let currentLayerIdx = 0;
+let layerNamesList = [];
+let layerVisible = [];
+let images = null;
+
+const LAYER_COLORS = [
+  [1.0, 0.42, 0.42],   // #ff6b6b 红
+  [0.31, 0.80, 0.77],   // #4ecdc4 青
+  [0.27, 0.72, 0.82],   // #45b7d1 蓝
+  [0.59, 0.81, 0.71],   // #96ceb4 绿
+  [1.0, 0.92, 0.65],    // #ffeaa7 黄
+  [0.87, 0.63, 0.87],   // #dda0dd 紫
+  [1.0, 0.55, 0.0],     // #ff8c00 橙
+  [0.0, 0.81, 0.82],    // #00ced1 深青
+];
+function layerColor(i) { return LAYER_COLORS[i % LAYER_COLORS.length]; }
+function layerColorHex(i) { const c = LAYER_COLORS[i % LAYER_COLORS.length]; return '#' + [c[0],c[1],c[2]].map(v => Math.round(v*255).toString(16).padStart(2,'0')).join(''); }
+
+let layerGL = {};
+
+// PCB context toggle
+let showCtxTracks = true;
+
+let viewCX, viewCY, viewZoom;
+let isDrag = false, lastMX = 0, lastMY = 0;
+
+let showEdges = true, showOutline = true, showVias = true, showPads = true;
+let currentViewMode = 'voltage'; // 'voltage' | 'power'
+
+let bounds = { minX:0, maxX:1, minY:0, maxY:1 };
+
+// Safe vertex access: handles both {x,y} and [x,y] formats
+function vx(v) { return v.x != null ? v.x : v[0]; }
+function vy(v) { return v.y != null ? v.y : v[1]; }
+
+
+// ============================================================
+// Shader helpers
+// ============================================================
+function compileShader(src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error('Shader error:', gl.getShaderInfoLog(s));
+    return null;
+  }
+  return s;
+}
+
+function linkProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(vs, gl.VERTEX_SHADER));
+  gl.attachShader(p, compileShader(fs, gl.FRAGMENT_SHADER));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error('Program error:', gl.getProgramInfoLog(p));
+    return null;
+  }
+  return p;
+}
+
+function getUniforms(prog, names) {
+  const u = {};
+  for (const n of names) u[n] = gl.getUniformLocation(prog, n);
+  return u;
+}
+
+function getAttribs(prog, names) {
+  const a = {};
+  for (const n of names) a[n] = gl.getAttribLocation(prog, n);
+  return a;
+}
+
+// ============================================================
+// Init WebGL
+// ============================================================
+function updateCmapTexture() {
+  if (!gl || !cmapTex) return;
+  const cmap = CMAPS[currentCmap] || PLASMA;
+  const n = cmap.length;
+  const data = new Uint8Array(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (n - 1);
+    const lo = Math.floor(t), hi = Math.min(lo + 1, n - 1);
+    const f = t - lo;
+    data[i*4+0] = Math.round((cmap[lo][0] * (1-f) + cmap[hi][0] * f) * 255);
+    data[i*4+1] = Math.round((cmap[lo][1] * (1-f) + cmap[hi][1] * f) * 255);
+    data[i*4+2] = Math.round((cmap[lo][2] * (1-f) + cmap[hi][2] * f) * 255);
+    data[i*4+3] = 255;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, cmapTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+}
+function initGL() {
+  canvas = document.getElementById('gl-canvas');
+  gl = canvas.getContext('webgl', { antialias: true, alpha: false, stencil: true });
+  if (!gl) { document.getElementById('loading').textContent = 'WebGL not supported'; return false; }
+
+  ext32bit = gl.getExtension('OES_element_index_uint');
+  console.log('[Results] WebGL stencil bits:', gl.getParameter(gl.STENCIL_BITS));
+
+  meshProg = { prog: linkProgram(VS_MESH, FS_MESH) };
+  if (!meshProg.prog) { console.error('[Results] meshProg FAILED to compile'); }
+  meshProg.u = getUniforms(meshProg.prog, ['u_mvp','u_cmap','u_alpha']);
+  meshProg.a = getAttribs(meshProg.prog, ['a_pos','a_val']);
+
+  lineProg = { prog: linkProgram(VS_LINE, FS_LINE) };
+  lineProg.u = getUniforms(lineProg.prog, ['u_mvp','u_color']);
+  lineProg.a = getAttribs(lineProg.prog, ['a_pos']);
+
+  pointProg = { prog: linkProgram(VS_POINT, FS_POINT) };
+  pointProg.u = getUniforms(pointProg.prog, ['u_mvp','u_size']);
+  pointProg.a = getAttribs(pointProg.prog, ['a_pos','a_col']);
+
+  cmapTex = gl.createTexture();
+  updateCmapTexture();
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  gl.clearColor(0.051, 0.067, 0.09, 1.0);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  return true;
+}
+
+// ============================================================
+// Data loading & buffer creation
+// ============================================================
+function loadData() {
+  try {
+    const raw = eda.sys_Storage.getExtensionUserConfig('pdn-results');
+    if (!raw || typeof raw !== 'string') return false;
+    const d = JSON.parse(raw);
+    resultData = d.result;
+    layerNames = d.layerNames || {};
+    connectionPoints = d.connectionPoints || {};
+    layerBoundaries = d.layerBoundaries || {};
+    pcbContext = d.pcbContext || null;
+    const warning = d.warningMessage;
+    if (warning) {
+      const banner = document.getElementById('warning-banner');
+      if (banner) { banner.textContent = warning; banner.style.display = 'block'; }
+    }
+    if (!resultData || !resultData.layerSolutions) return false;
+
+    try {
+      const rawImgs = eda.sys_Storage.getExtensionUserConfig('pdn-results-images');
+      if (rawImgs && typeof rawImgs === 'string') images = JSON.parse(rawImgs);
+    } catch(e) {}
+
+    layerNamesList = resultData.layerSolutions.map((ls, i) => ls.layerName || layerNames[i] || ('Layer ' + i));
+    layerVisible = layerNamesList.map(() => true);
+
+    let bx0=Infinity, bx1=-Infinity, by0=Infinity, by1=-Infinity;
+    for (const ls of resultData.layerSolutions) {
+      for (const m of ls.meshes) {
+        for (const v of m.vertices) {
+          const x = vx(v), y = vy(v);
+          if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
+          if (y < by0) by0 = y; if (y > by1) by1 = y;
+        }
+      }
+    }
+    if (bx0 === Infinity) return false;
+    bounds = { minX: bx0, maxX: bx1, minY: by0, maxY: by1 };
+
+    // Expand bounds with PCB context tracks and pads
+    if (pcbContext) {
+      for (const t of (pcbContext.contextTracks || [])) {
+        if (t.x1 < bounds.minX) bounds.minX = t.x1; if (t.x1 > bounds.maxX) bounds.maxX = t.x1;
+        if (t.y1 < bounds.minY) bounds.minY = t.y1; if (t.y1 > bounds.maxY) bounds.maxY = t.y1;
+        if (t.x2 < bounds.minX) bounds.minX = t.x2; if (t.x2 > bounds.maxX) bounds.maxX = t.x2;
+        if (t.y2 < bounds.minY) bounds.minY = t.y2; if (t.y2 > bounds.maxY) bounds.maxY = t.y2;
+      }
+      for (const p of (pcbContext.contextPads || [])) {
+        const hw = p.width / 2, hh = p.height / 2;
+        if (p.x - hw < bounds.minX) bounds.minX = p.x - hw;
+        if (p.x + hw > bounds.maxX) bounds.maxX = p.x + hw;
+        if (p.y - hh < bounds.minY) bounds.minY = p.y - hh;
+        if (p.y + hh > bounds.maxY) bounds.maxY = p.y + hh;
+      }
+    }
+
+    buildAllLayerBuffers();
+    resetView();
+    return true;
+  } catch(e) { console.error('[Results] Load error:', e); return false; }
+}
+
+function buildAllLayerBuffers() {
+  layerGL = {};
+  for (let li = 0; li < resultData.layerSolutions.length; li++) {
+    layerGL[li] = buildLayerBuffers(resultData.layerSolutions[li], li);
+  }
+}
+
+function buildLayerBuffers(ls, li) {
+  const glData = {};
+  let positions = [], voltages = [], powerDensities = [], indices = [];
+  let offset = 0;
+  for (const m of ls.meshes) {
+    const n = m.vertices.length;
+    for (let i = 0; i < n; i++) {
+      positions.push(vx(m.vertices[i]), vy(m.vertices[i]));
+      voltages.push(m.potentials[i] != null && isFinite(m.potentials[i]) ? m.potentials[i] : 0);
+    }
+    // Power density: may be per-face or per-vertex
+    const pd = m.powerDensities || [];
+    if (pd.length === m.triangles.length && pd.length !== m.vertices.length) {
+      // Per-face → average to per-vertex
+      const vpds = new Array(n).fill(0);
+      const vcnt = new Array(n).fill(0);
+      for (let ti = 0; ti < m.triangles.length; ti++) {
+        const tri = m.triangles[ti];
+        const tv = Array.isArray(tri) ? tri : (tri.vertices || tri);
+        if (!tv || tv.length < 3) continue;
+        const val = pd[ti] != null && isFinite(pd[ti]) ? pd[ti] : 0;
+        for (const vi of tv) { vpds[vi] += val; vcnt[vi]++; }
+      }
+      for (let i = 0; i < n; i++) powerDensities.push(vcnt[i] > 0 ? vpds[i] / vcnt[i] : 0);
+    } else if (pd.length === n) {
+      for (const v of pd) powerDensities.push(v != null && isFinite(v) ? v : 0);
+    } else {
+      for (let i = 0; i < n; i++) powerDensities.push(0);
+    }
+    for (const tri of m.triangles) {
+      const v = Array.isArray(tri) ? tri : (tri.vertices || tri);
+      if (!v || v.length < 3) continue;
+      indices.push(v[0]+offset, v[1]+offset, v[2]+offset);
+    }
+    offset += n;
+  }
+
+  // === Build buffers that DON'T depend on connected mesh data (board, outline, disc, points) ===
+  const lname = layerNamesList[li];
+
+  // Connection points (vias)
+  const cps = connectionPoints[lname] || [];
+  if (cps.length > 0) {
+    const ptData = new Float32Array(cps.length * 5);
+    for (let i = 0; i < cps.length; i++) {
+      const cp = cps[i];
+      const col = cp.is_source ? [1.0, 0.2, 0.2] : [0.5, 0.5, 0.5];
+      ptData[i*5] = cp.x; ptData[i*5+1] = cp.y;
+      ptData[i*5+2] = col[0]; ptData[i*5+3] = col[1]; ptData[i*5+4] = col[2];
+    }
+    glData.pointVBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, glData.pointVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, ptData, gl.STATIC_DRAW);
+    glData.pointCount = cps.length;
+  }
+
+  // Outlines
+  const polys = layerBoundaries[lname] || [];
+  const outlineVerts = [];
+  for (const poly of polys) {
+    const ext = poly.exterior;
+    for (let i = 0; i < ext.length - 1; i++) {
+      outlineVerts.push(ext[i][0], ext[i][1], ext[i+1][0], ext[i+1][1]);
+    }
+    for (const hole of (poly.holes || [])) {
+      for (let i = 0; i < hole.length - 1; i++) {
+        outlineVerts.push(hole[i][0], hole[i][1], hole[i+1][0], hole[i+1][1]);
+      }
+    }
+  }
+  if (outlineVerts.length > 0) {
+    glData.outlineVBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, glData.outlineVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(outlineVerts), gl.STATIC_DRAW);
+    glData.outlineCount = outlineVerts.length / 4;
+  }
+
+  // Board copper fill: stencil-based polygon fill for copper pour shapes
+  const boardStencilVerts = [];
+  const boardStencilFans = [];
+  for (const poly of polys) {
+    const ext = poly.exterior;
+    if (!ext || ext.length < 3) continue;
+    const off = boardStencilVerts.length / 2;
+    for (const pt of ext) boardStencilVerts.push(pt[0], pt[1]);
+    boardStencilFans.push({ offset: off, count: ext.length });
+    for (const hole of (poly.holes || [])) {
+      if (hole.length < 3) continue;
+      const hOff = boardStencilVerts.length / 2;
+      for (const pt of hole) boardStencilVerts.push(pt[0], pt[1]);
+      boardStencilFans.push({ offset: hOff, count: hole.length });
+    }
+  }
+  if (boardStencilVerts.length > 0) {
+    glData.copperStencilVBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, glData.copperStencilVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(boardStencilVerts), gl.STATIC_DRAW);
+    glData.copperStencilFans = boardStencilFans;
+  }
+  // Bounding box quad for stencil fill
+  const bMargin = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY) * 0.05;
+  const bx0 = bounds.minX - bMargin, by0 = bounds.minY - bMargin;
+  const bx1 = bounds.maxX + bMargin, by1 = bounds.maxY + bMargin;
+  glData.boardQuadVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, glData.boardQuadVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([bx0,by0, bx1,by0, bx1,by1, bx0,by1]), gl.STATIC_DRAW);
+  glData.boardQuadIBO = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, glData.boardQuadIBO);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2, 0,2,3]), gl.STATIC_DRAW);
+
+  // Context tracks (per-layer, bound to this layer)
+  if (pcbContext && pcbContext.contextTracks) {
+    let layerId = -1;
+    for (const [id, name] of Object.entries(layerNames)) {
+      if (name === lname) { layerId = Number(id); break; }
+    }
+    if (layerId >= 0) {
+      const tracks = pcbContext.contextTracks.filter(t => t.layer === layerId);
+      if (tracks.length > 0) {
+        const trackVerts = [];
+        for (const t of tracks) {
+          trackVerts.push(t.x1, t.y1, t.x2, t.y2);
+        }
+        glData.ctxTracksVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, glData.ctxTracksVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(trackVerts), gl.STATIC_DRAW);
+        glData.ctxTracksCount = tracks.length;
+      }
+    }
+  }
+
+  // Pads (per-layer): rectangle outline + inner circle for hole
+  if (pcbContext && pcbContext.contextPads) {
+    let padLayerId = -1;
+    for (const [id, name] of Object.entries(layerNames)) {
+      if (name === lname) { padLayerId = Number(id); break; }
+    }
+    if (padLayerId >= 0) {
+      const pads = pcbContext.contextPads.filter(p => p.layer == null || p.layer === padLayerId);
+      if (pads.length > 0) {
+        const padVerts = [];
+        for (const p of pads) {
+          const hw = p.width / 2, hh = p.height / 2;
+          // Rectangle outline: 4 edges
+          padVerts.push(
+            p.x - hw, p.y - hh,  p.x + hw, p.y - hh,
+            p.x + hw, p.y - hh,  p.x + hw, p.y + hh,
+            p.x + hw, p.y + hh,  p.x - hw, p.y + hh,
+            p.x - hw, p.y + hh,  p.x - hw, p.y - hh,
+          );
+          // Circle for hole (12 segments)
+          const hr = p.hole_diameter / 2;
+          if (hr > 0) {
+            const nSeg = 12;
+            for (let k = 0; k < nSeg; k++) {
+              const a1 = (k / nSeg) * 2 * Math.PI;
+              const a2 = ((k + 1) / nSeg) * 2 * Math.PI;
+              padVerts.push(
+                p.x + hr * Math.cos(a1), p.y + hr * Math.sin(a1),
+                p.x + hr * Math.cos(a2), p.y + hr * Math.sin(a2),
+              );
+            }
+          }
+        }
+        glData.padsVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, glData.padsVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(padVerts), gl.STATIC_DRAW);
+        glData.padsLineCount = padVerts.length / 4;
+      }
+    }
+  }
+
+  // Disconnected meshes
+  const discMeshes = ls.disconnectedMeshes || [];
+  if (discMeshes.length > 0) {
+    let discPos = [], discIdx = [], discOff = 0;
+    for (const dm of discMeshes) {
+      const dn = dm.vertices?.length || 0;
+      for (let i = 0; i < dn; i++) {
+        discPos.push(vx(dm.vertices[i]), vy(dm.vertices[i]));
+      }
+      for (const tri of (dm.triangles || [])) {
+        const v = Array.isArray(tri) ? tri : (tri.vertices || tri);
+        if (!v || v.length < 3) continue;
+        discIdx.push(v[0]+discOff, v[1]+discOff, v[2]+discOff);
+      }
+      discOff += dn;
+    }
+    if (discPos.length > 0) {
+      glData.discVBO = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, glData.discVBO);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(discPos), gl.STATIC_DRAW);
+      glData.discIBO = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, glData.discIBO);
+      const dNeed32 = discIdx.length >= 65536 && ext32bit;
+      const dIdx = dNeed32 ? new Uint32Array(discIdx) : new Uint16Array(discIdx);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, dIdx, gl.STATIC_DRAW);
+      glData.discIdxType = dNeed32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+      glData.discTriCount = discIdx.length;
+    }
+  }
+
+  // === Early return if no connected mesh data ===
+  if (positions.length === 0) {
+    console.log('[Results] Layer', li, ': no connected mesh, board fill =', !!glData.copperStencilVBO, 'disc =', !!glData.discVBO);
+    return glData;
+  }
+
+  // === Build connected mesh buffers ===
+  let vMin = Infinity, vMax = -Infinity;
+  for (const v of voltages) { if (v < vMin) vMin = v; if (v > vMax) vMax = v; }
+  if (vMin === Infinity) { vMin = 0; vMax = 1; }
+  glData.vMin = vMin; glData.vMax = vMax;
+
+  // Normalize voltages to [0,1] in JS to avoid GPU precision loss with small ranges
+  const vRange = vMax - vMin;
+  const verts = new Float32Array(positions.length / 2 * 3);
+  for (let i = 0, j = 0; i < positions.length; i += 2, j += 3) {
+    verts[j] = positions[i]; verts[j+1] = positions[i+1];
+    verts[j+2] = vRange > 0 ? (voltages[i/2] - vMin) / vRange : 0.5;
+  }
+  glData.meshVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, glData.meshVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+
+  // Power density VBO — 对数刻度
+  let pdMin = Infinity, pdMax = -Infinity;
+  for (const v of powerDensities) {
+    if (v > 0) { if (v < pdMin) pdMin = v; if (v > pdMax) pdMax = v; }
+  }
+  if (pdMin === Infinity) { pdMin = 0; pdMax = 1; }
+  glData.pdMin = pdMin; glData.pdMax = pdMax;
+  const logMin = Math.log10(Math.max(pdMin, 1e-30));
+  const logMax = Math.log10(Math.max(pdMax, 1e-30));
+  const logRange = logMax - logMin;
+  const pdVerts = new Float32Array(positions.length / 2 * 3);
+  for (let i = 0, j = 0; i < positions.length; i += 2, j += 3) {
+    pdVerts[j] = positions[i]; pdVerts[j+1] = positions[i+1];
+    const v = powerDensities[i/2];
+    pdVerts[j+2] = v > 0 && logRange > 0 ? (Math.log10(v) - logMin) / logRange : 0.0;
+  }
+  glData.meshPDVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, glData.meshPDVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, pdVerts, gl.STATIC_DRAW);
+
+  // Index buffer with 32-bit extension check
+  if (indices.length >= 65536 && !ext32bit) {
+    console.warn('[Results] Large mesh without OES_element_index_uint — truncating');
+    indices = indices.slice(0, 65532);
+  }
+  const need32 = indices.length >= 65536 && ext32bit;
+  const idxArr = need32 ? new Uint32Array(indices) : new Uint16Array(indices);
+  glData.meshIBO = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, glData.meshIBO);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxArr, gl.STATIC_DRAW);
+  glData.indexType = need32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+  glData.triCount = indices.length;
+
+  // Edges
+  const edgeSet = new Set();
+  const edgeVerts = [];
+  const posArr = new Float32Array(positions);
+  for (let i = 0; i < indices.length; i += 3) {
+    const a=indices[i], b=indices[i+1], c=indices[i+2];
+    addEdge(a,b); addEdge(b,c); addEdge(c,a);
+  }
+  function addEdge(a,b) {
+    const k = Math.min(a,b)+','+Math.max(a,b);
+    if (edgeSet.has(k)) return;
+    edgeSet.add(k);
+    edgeVerts.push(posArr[a*2], posArr[a*2+1], posArr[b*2], posArr[b*2+1]);
+  }
+  if (edgeVerts.length > 0) {
+    glData.edgeVBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, glData.edgeVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(edgeVerts), gl.STATIC_DRAW);
+    glData.edgeCount = edgeVerts.length / 4;
+  }
+
+  console.log('[Results] Layer', li, ': mesh OK, board =', !!glData.copperStencilVBO, 'fans =', glData.copperStencilFans?.length, 'disc =', !!glData.discVBO);
+  return glData;
+}
+
+// ============================================================
+// View / MVP
+// ============================================================
+function resetView() {
+  viewCX = (bounds.minX + bounds.maxX) / 2;
+  viewCY = (bounds.minY + bounds.maxY) / 2;
+  const w = bounds.maxX - bounds.minX || 1;
+  const h = bounds.maxY - bounds.minY || 1;
+  viewZoom = Math.min(1.8 / w, 1.8 / h) * 0.92;
+}
+
+function computeMVP() {
+  const aspect = canvas.width / canvas.height;
+  const s = viewZoom;
+  return new Float32Array([
+    s / aspect, 0, 0, 0,
+    0, s, 0, 0,
+    0, 0, 1, 0,
+    -s * viewCX / aspect, -s * viewCY, 0, 1
+  ]);
+}
+
+function screenToWorld(sx, sy) {
+  const aspect = canvas.width / canvas.height;
+  const clipX = (sx / canvas.width) * 2 - 1;
+  const clipY = 1 - (sy / canvas.height) * 2;
+  return {
+    x: clipX * aspect / viewZoom + viewCX,
+    y: clipY / viewZoom + viewCY
+  };
+}
+
+// ============================================================
+// Render
+// ============================================================
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.round(rect.width * dpr);
+  const h = Math.round(rect.height * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+  }
+}
+
+function render() {
+  if (!gl) return;
+  resizeCanvas();
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  const mvp = computeMVP();
+
+  // Render visible layers; the currently selected layer is rendered LAST (on top)
+  // so the user can always see and hover over the selected layer's data
+  for (let li = 0; li < layerNamesList.length; li++) {
+    if (!layerVisible[li] || li === currentLayerIdx) continue;
+    renderSingleLayer(li, mvp);
+  }
+  // Selected layer always on top
+  if (layerVisible[currentLayerIdx]) {
+    renderSingleLayer(currentLayerIdx, mvp);
+  }
+
+}
+
+function renderSingleLayer(li, mvp) {
+  const gd = layerGL[li];
+  if (!gd || (!gd.meshVBO && !gd.copperStencilVBO)) return;
+
+  // 0) Copper pour fill
+  if (gd.copperStencilVBO && gd.copperStencilFans && gd.boardQuadVBO) {
+    gl.enable(gl.STENCIL_TEST);
+    gl.clearStencil(0);
+    gl.clear(gl.STENCIL_BUFFER_BIT);
+
+    gl.stencilFunc(gl.ALWAYS, 0, 0xFF);
+    gl.stencilOp(gl.KEEP, gl.KEEP, gl.INVERT);
+    gl.colorMask(false, false, false, false);
+
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.u_mvp, false, mvp);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.copperStencilVBO);
+    gl.enableVertexAttribArray(lineProg.a.a_pos);
+    gl.vertexAttribPointer(lineProg.a.a_pos, 2, gl.FLOAT, false, 0, 0);
+    for (const fan of gd.copperStencilFans) {
+      gl.drawArrays(gl.TRIANGLE_FAN, fan.offset, fan.count);
+    }
+
+    gl.colorMask(true, true, true, true);
+    gl.stencilFunc(gl.NOTEQUAL, 0, 0xFF);
+    gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+    gl.uniform4f(lineProg.u.u_color, 0.04, 0.10, 0.06, 1.0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.boardQuadVBO);
+    gl.vertexAttribPointer(lineProg.a.a_pos, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gd.boardQuadIBO);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+    gl.disableVertexAttribArray(lineProg.a.a_pos);
+    gl.disable(gl.STENCIL_TEST);
+  }
+
+  // 1) Mesh triangles
+  if (gd.meshVBO && meshProg.prog) {
+    gl.useProgram(meshProg.prog);
+    gl.uniformMatrix4fv(meshProg.u.u_mvp, false, mvp);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, cmapTex);
+    gl.uniform1i(meshProg.u.u_cmap, 0);
+    gl.uniform1f(meshProg.u.u_alpha, 1.0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, currentViewMode === 'power' ? gd.meshPDVBO : gd.meshVBO);
+    const stride = 3 * 4;
+    gl.enableVertexAttribArray(meshProg.a.a_pos);
+    gl.vertexAttribPointer(meshProg.a.a_pos, 2, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(meshProg.a.a_val);
+    gl.vertexAttribPointer(meshProg.a.a_val, 1, gl.FLOAT, false, stride, 8);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gd.meshIBO);
+    gl.drawElements(gl.TRIANGLES, gd.triCount, gd.indexType, 0);
+
+    gl.disableVertexAttribArray(meshProg.a.a_val);
+  }
+
+  // 1.5) Disconnected meshes
+  if (gd.discVBO && gd.discIBO) {
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.u_mvp, false, mvp);
+    gl.uniform4f(lineProg.u.u_color, 0.03, 0.16, 0.05, 1.0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.discVBO);
+    gl.enableVertexAttribArray(lineProg.a.a_pos);
+    gl.vertexAttribPointer(lineProg.a.a_pos, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gd.discIBO);
+    gl.drawElements(gl.TRIANGLES, gd.discTriCount, gd.discIdxType, 0);
+    gl.disableVertexAttribArray(lineProg.a.a_pos);
+  }
+
+  // 2) Mesh edges
+  if (showEdges && gd.edgeVBO) {
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.u_mvp, false, mvp);
+    gl.uniform4f(lineProg.u.u_color, 0.4, 0.4, 0.5, 0.25);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.edgeVBO);
+    gl.enableVertexAttribArray(lineProg.a.a_pos);
+    gl.vertexAttribPointer(lineProg.a.a_pos, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.LINES, 0, gd.edgeCount * 2);
+    gl.disableVertexAttribArray(lineProg.a.a_pos);
+  }
+
+  // 3) Polygon outlines
+  if (showOutline && gd.outlineVBO) {
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.u_mvp, false, mvp);
+    gl.uniform4f(lineProg.u.u_color, 0.0, 0.83, 1.0, 0.7);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.outlineVBO);
+    gl.enableVertexAttribArray(lineProg.a.a_pos);
+    gl.vertexAttribPointer(lineProg.a.a_pos, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.LINES, 0, gd.outlineCount * 2);
+    gl.disableVertexAttribArray(lineProg.a.a_pos);
+  }
+
+  // 3.5) Context tracks (per-layer)
+  if (showCtxTracks && gd.ctxTracksVBO && gd.ctxTracksCount > 0) {
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.u_mvp, false, mvp);
+    gl.uniform4f(lineProg.u.u_color, 0.35, 0.35, 0.3, 0.45);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.ctxTracksVBO);
+    gl.enableVertexAttribArray(lineProg.a.a_pos);
+    gl.vertexAttribPointer(lineProg.a.a_pos, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.LINES, 0, gd.ctxTracksCount * 2);
+    gl.disableVertexAttribArray(lineProg.a.a_pos);
+  }
+
+  // 3.6) Pads: rectangle + circle
+  if (showPads && gd.padsVBO && gd.padsLineCount > 0) {
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.u_mvp, false, mvp);
+    gl.uniform4f(lineProg.u.u_color, 0.75, 0.65, 0.30, 0.7);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.padsVBO);
+    gl.enableVertexAttribArray(lineProg.a.a_pos);
+    gl.vertexAttribPointer(lineProg.a.a_pos, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.LINES, 0, gd.padsLineCount * 2);
+    gl.disableVertexAttribArray(lineProg.a.a_pos);
+  }
+
+  // 4) Connection points
+  if (showVias && gd.pointVBO) {
+    gl.useProgram(pointProg.prog);
+    gl.uniformMatrix4fv(pointProg.u.u_mvp, false, mvp);
+    const pcbSize = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+    const dpr = window.devicePixelRatio || 1;
+    const ptSize = Math.max(8, pcbSize * viewZoom * dpr * 0.006);
+    gl.uniform1f(pointProg.u.u_size, ptSize);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gd.pointVBO);
+    const ptStride = 5 * 4;
+    gl.enableVertexAttribArray(pointProg.a.a_pos);
+    gl.vertexAttribPointer(pointProg.a.a_pos, 2, gl.FLOAT, false, ptStride, 0);
+    gl.enableVertexAttribArray(pointProg.a.a_col);
+    gl.vertexAttribPointer(pointProg.a.a_col, 3, gl.FLOAT, false, ptStride, 8);
+    gl.drawArrays(gl.POINTS, 0, gd.pointCount);
+    gl.disableVertexAttribArray(pointProg.a.a_pos);
+    gl.disableVertexAttribArray(pointProg.a.a_col);
+  }
+}
+
+
+
+// ============================================================
+// Interaction
+// ============================================================
+function setupInteraction() {
+  canvas.addEventListener('mousedown', e => {
+    if (e.button === 0 || e.button === 1) { isDrag = true; lastMX = e.offsetX; lastMY = e.offsetY; e.preventDefault(); canvas.style.cursor = 'grabbing'; }
+  });
+  window.addEventListener('mouseup', e => { if (e.button === 0 || e.button === 1) { isDrag = false; canvas.style.cursor = 'crosshair'; } });
+  canvas.addEventListener('auxclick', e => e.preventDefault());
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('mousemove', e => {
+    if (isDrag) {
+      const aspect = canvas.width / canvas.height;
+      viewCX -= (e.offsetX - lastMX) * 2 * aspect / (viewZoom * canvas.width);
+      viewCY += (e.offsetY - lastMY) * 2 / (viewZoom * canvas.height);
+      lastMX = e.offsetX; lastMY = e.offsetY;
+      render();
+    }
+    tooltipEvent = e;
+    updateStatus(e.offsetX, e.offsetY);
+  });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const before = screenToWorld(e.offsetX, e.offsetY);
+    viewZoom *= e.deltaY > 0 ? 0.9 : 1.1;
+    viewZoom = Math.max(0.0001, Math.min(10000, viewZoom));
+    const after = screenToWorld(e.offsetX, e.offsetY);
+    viewCX += before.x - after.x;
+    viewCY += before.y - after.y;
+    render();
+  }, { passive: false });
+
+  window.addEventListener('keydown', e => {
+    if (e.key === 'e' || e.key === 'E') { showEdges = !showEdges; updateToggles(); render(); }
+    if (e.key === 'o' || e.key === 'O') { showOutline = !showOutline; updateToggles(); render(); }
+    if (e.key === 'v' || e.key === 'V') toggleLayer();
+    if (e.key === 'r' || e.key === 'R') { resetView(); render(); }
+    if (e.key === 'c' || e.key === 'C') { showVias = !showVias; updateToggles(); render(); }
+    if (e.key === 't' || e.key === 'T') { showCtxTracks = !showCtxTracks; updateToggles(); render(); }
+    if (e.key === 'd' || e.key === 'D') { showPads = !showPads; updateToggles(); render(); }
+    if (e.key === 'p' || e.key === 'P') toggleViewMode();
+  });
+
+  window.addEventListener('resize', render);
+}
+
+function updateStatus(mx, my) {
+  const w = screenToWorld(mx, my);
+  document.getElementById('st-pos').textContent = `X: ${w.x.toFixed(3)}  Y: ${w.y.toFixed(3)}`;
+
+  const gd = layerGL[currentLayerIdx];
+  if (!gd) { updateTooltip(null, w); return; }
+
+  const value = pickValue(w.x, w.y);
+  if (value != null && isFinite(value)) {
+    if (currentViewMode === 'power') {
+      document.getElementById('st-voltage').textContent = `功率密度: ${value.toExponential(4)} W/m²`;
+      document.getElementById('st-delta').textContent = `Δ: ${(value > 0 ? value - (gd.pdMin || 0) : 0).toExponential(4)} W/m²`;
+    } else {
+      document.getElementById('st-voltage').textContent = `电压: ${value.toFixed(6)} V`;
+      const delta = value - (gd.vMin || 0);
+      document.getElementById('st-delta').textContent = `Δ: ${delta.toFixed(6)} V`;
+    }
+  } else {
+    document.getElementById('st-voltage').textContent = currentViewMode === 'power' ? '功率密度: --' : '电压: --';
+    document.getElementById('st-delta').textContent = 'Δ: --';
+  }
+  updateTooltip(value, w);
+}
+
+function pickValue(wx, wy) {
+  const ls = resultData.layerSolutions[currentLayerIdx];
+  for (const m of ls.meshes) {
+    const values = currentViewMode === 'power' ? (m.powerDensities || []) : m.potentials;
+    // If powerDensities is per-face, use per-face lookup
+    const isPerFace = currentViewMode === 'power' && values.length === m.triangles.length && values.length !== m.vertices.length;
+    for (let i = 0; i < m.triangles.length; i++) {
+      const tri = m.triangles[i];
+      const tv = Array.isArray(tri) ? tri : (tri.vertices || tri);
+      if (!tv || tv.length < 3) continue;
+      const ax = vx(m.vertices[tv[0]]), ay = vy(m.vertices[tv[0]]);
+      const bx = vx(m.vertices[tv[1]]), by = vy(m.vertices[tv[1]]);
+      const cx = vx(m.vertices[tv[2]]), cy = vy(m.vertices[tv[2]]);
+      const tMinX = Math.min(ax,bx,cx), tMaxX = Math.max(ax,bx,cx);
+      const tMinY = Math.min(ay,by,cy), tMaxY = Math.max(ay,by,cy);
+      if (wx < tMinX || wx > tMaxX || wy < tMinY || wy > tMaxY) continue;
+      const denom = (by-cy)*(ax-cx) + (cx-bx)*(ay-cy);
+      if (Math.abs(denom) < 1e-12) continue;
+      const la = ((by-cy)*(wx-cx) + (cx-bx)*(wy-cy)) / denom;
+      const lb = ((cy-ay)*(wx-cx) + (ax-cx)*(wy-cy)) / denom;
+      const lc = 1 - la - lb;
+      if (la >= -0.001 && lb >= -0.001 && lc >= -0.001) {
+        if (isPerFace) {
+          const v = values[i];
+          return v != null && isFinite(v) ? v : null;
+        }
+        const va = values[tv[0]], vb = values[tv[1]], vc = values[tv[2]];
+        if (va != null && vb != null && vc != null)
+          return la*va + lb*vb + lc*vc;
+      }
+    }
+  }
+  return null;
+}
+
+let tooltipEvent = null;
+function updateTooltip(voltage, w) {
+  const el = document.getElementById('tooltip');
+  if (!tooltipEvent || !resultData) { el.style.display = 'none'; return; }
+  if (voltage != null && isFinite(voltage)) {
+    const valStr = currentViewMode === 'power' ? `${voltage.toExponential(4)} W/m²` : `${voltage.toFixed(6)} V`;
+    el.innerHTML = `${valStr}<br><span style="color:#8b949e">${w.x.toFixed(3)}, ${w.y.toFixed(3)}</span>`;
+    el.style.display = '';
+  } else {
+    el.style.display = 'none';
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const ox = tooltipEvent.clientX - rect.left + 14;
+  const oy = tooltipEvent.clientY - rect.top - 10;
+  el.style.left = ox + 'px';
+  el.style.top = oy + 'px';
+}
+
+function updateToggles() {
+  document.getElementById('btn-edges').classList.toggle('active', showEdges);
+  document.getElementById('btn-outline').classList.toggle('active', showOutline);
+  document.getElementById('btn-vias').classList.toggle('active', showVias);
+  document.getElementById('btn-ctx-tracks').classList.toggle('active', showCtxTracks);
+  document.getElementById('btn-pads').classList.toggle('active', showPads);
+  document.getElementById('btn-viewmode').classList.toggle('active', currentViewMode === 'power');
+}
+
+function toggleLayer() {
+  currentLayerIdx = (currentLayerIdx + 1) % layerNamesList.length;
+  updateSidebarActive();
+  onLayerChange();
+}
+
+function toggleViewMode() {
+  currentViewMode = currentViewMode === 'voltage' ? 'power' : 'voltage';
+  document.getElementById('btn-viewmode').classList.toggle('active', currentViewMode === 'power');
+  drawColorbar();
+  updateInfoPanel();
+  render();
+}
+
+function onLayerChange() {
+  document.getElementById('st-layer').textContent = '层: ' + layerNamesList[currentLayerIdx];
+  updateInfoPanel();
+  drawColorbar();
+  render();
+}
+
+// ============================================================
+// UI
+// ============================================================
+function setupUI() {
+  buildSidebar();
+
+  document.getElementById('btn-edges').addEventListener('click', () => { showEdges = !showEdges; updateToggles(); render(); });
+  document.getElementById('btn-outline').addEventListener('click', () => { showOutline = !showOutline; updateToggles(); render(); });
+  document.getElementById('btn-vias').addEventListener('click', () => { showVias = !showVias; updateToggles(); render(); });
+  document.getElementById('btn-ctx-tracks').addEventListener('click', () => { showCtxTracks = !showCtxTracks; updateToggles(); render(); });
+  document.getElementById('btn-pads').addEventListener('click', () => { showPads = !showPads; updateToggles(); render(); });
+  document.getElementById('btn-viewmode').addEventListener('click', toggleViewMode);
+  document.getElementById('btn-reset').addEventListener('click', () => { resetView(); render(); });
+
+  document.getElementById('cmap-select').addEventListener('change', e => {
+    currentCmap = e.target.value;
+    updateCmapTexture();
+    drawColorbar();
+    render();
+  });
+
+  document.getElementById('st-layer').textContent = '层: ' + layerNamesList[currentLayerIdx];
+  updateInfoPanel();
+}
+
+function buildSidebar() {
+  const container = document.getElementById('sidebar-layers');
+  container.innerHTML = '';
+  for (let i = 0; i < layerNamesList.length; i++) {
+    const item = document.createElement('div');
+    item.className = 'layer-item' + (i === currentLayerIdx ? ' active' : '');
+    item.dataset.idx = i;
+
+    const dot = document.createElement('span');
+    dot.className = 'layer-dot';
+    dot.style.background = layerColorHex(i);
+
+    const name = document.createElement('span');
+    name.className = 'layer-name';
+    name.textContent = layerNamesList[i];
+    name.title = layerNamesList[i];
+
+    const eye = document.createElement('button');
+    eye.className = 'layer-eye' + (layerVisible[i] ? '' : ' hidden');
+    eye.innerHTML = layerVisible[i] ? '&#128065;' : '&#9673;';
+    eye.title = layerVisible[i] ? '隐藏' : '显示';
+    eye.addEventListener('click', (e) => {
+      e.stopPropagation();
+      layerVisible[i] = !layerVisible[i];
+      eye.className = 'layer-eye' + (layerVisible[i] ? '' : ' hidden');
+      eye.innerHTML = layerVisible[i] ? '&#128065;' : '&#9673;';
+      eye.title = layerVisible[i] ? '隐藏' : '显示';
+      render();
+    });
+
+    item.appendChild(dot);
+    item.appendChild(name);
+    item.appendChild(eye);
+    item.addEventListener('click', () => {
+      currentLayerIdx = i;
+      onLayerChange();
+      updateSidebarActive();
+    });
+    container.appendChild(item);
+  }
+}
+
+function updateSidebarActive() {
+  const items = document.querySelectorAll('.layer-item');
+  items.forEach(el => {
+    el.classList.toggle('active', parseInt(el.dataset.idx) === currentLayerIdx);
+  });
+}
+
+function showAllLayers() {
+  layerVisible = layerNamesList.map(() => true);
+  buildSidebar();
+  render();
+}
+
+function hideAllLayers() {
+  layerVisible = layerNamesList.map(() => false);
+  buildSidebar();
+  render();
+}
+
+function updateInfoPanel() {
+  const panel = document.getElementById('info-panel');
+  const ls = resultData.layerSolutions[currentLayerIdx];
+  if (!ls) { panel.style.display = 'none'; return; }
+
+  let totalVerts = 0, totalTris = 0, minV = Infinity, maxV = -Infinity;
+  let minPD = Infinity, maxPD = -Infinity;
+  for (const m of ls.meshes) {
+    totalVerts += m.vertices.length;
+    totalTris += m.triangles.length;
+    for (const p of m.potentials) {
+      if (p != null && isFinite(p)) { if (p < minV) minV = p; if (p > maxV) maxV = p; }
+    }
+    for (const p of (m.powerDensities || [])) {
+      if (p != null && isFinite(p)) { if (p < minPD) minPD = p; if (p > maxPD) maxPD = p; }
+    }
+  }
+  if (minV === Infinity) { minV = 0; maxV = 0; }
+  if (minPD === Infinity) { minPD = 0; maxPD = 0; }
+  const drop = maxV - minV;
+
+  const info = resultData.solverInfo;
+  let html = `<span class="label">层:</span> <span class="value">${layerNamesList[currentLayerIdx]}</span><br>`;
+  html += `<span class="label">网格:</span> <span class="value">${totalVerts} 顶点, ${totalTris} 三角形</span><br>`;
+  if (currentViewMode === 'power') {
+    const pdRangeStr = maxPD > 0
+      ? `${minPD.toExponential(2)} ~ ${maxPD.toExponential(2)} W/m² (log)`
+      : '无功率密度数据';
+    html += `<span class="label">功率密度:</span> <span class="value">${pdRangeStr}</span><br>`;
+  } else {
+    html += `<span class="label">电压范围:</span> <span class="value">${minV.toFixed(4)} ~ ${maxV.toFixed(4)} V</span><br>`;
+    html += `<span class="label">压降:</span> <span class="value${drop > 0.1 ? ' warn' : ''}">${drop.toFixed(4)} V</span>`;
+  }
+  if (info) {
+    const gniVal = info.groundNodeCurrent;
+    const gniStr = gniVal != null ? gniVal.toFixed(6) : 'N/A';
+    const gniClass = gniVal != null && Math.abs(gniVal) > 0.001 ? 'warn' : '';
+    html += `<br><span class="label">地电流:</span> <span class="value ${gniClass}">${gniStr} A</span>`;
+  }
+  panel.innerHTML = html;
+  panel.style.display = '';
+}
+
+function drawColorbar() {
+  const gd = layerGL[currentLayerIdx];
+  if (!gd) return;
+  const el = document.getElementById('colorbar');
+  el.style.display = '';
+  const c = document.getElementById('cb-canvas');
+  const ctx = c.getContext('2d');
+  const h = c.height, w = c.width;
+  const cmap = CMAPS[currentCmap] || PLASMA;
+  const cn = cmap.length;
+  for (let y = 0; y < h; y++) {
+    const t = 1 - y / h;
+    const pos = t * (cn - 1);
+    const lo = Math.floor(pos), hi = Math.min(lo + 1, cn - 1);
+    const f = pos - lo;
+    const r = Math.round((cmap[lo][0]*(1-f) + cmap[hi][0]*f)*255);
+    const g = Math.round((cmap[lo][1]*(1-f) + cmap[hi][1]*f)*255);
+    const b = Math.round((cmap[lo][2]*(1-f) + cmap[hi][2]*f)*255);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(0, y, w, 1);
+  }
+  document.getElementById('cb-max').textContent = (currentViewMode === 'power' ? gd.pdMax.toExponential(2) : gd.vMax.toFixed(4)) + (currentViewMode === 'power' ? ' W/m²' : ' V');
+  document.getElementById('cb-min').textContent = (currentViewMode === 'power' ? gd.pdMin.toExponential(2) : gd.vMin.toFixed(4)) + (currentViewMode === 'power' ? ' W/m²' : ' V');
+}
+
+function closeWindow() {
+  eda.sys_MessageBus.publish('pdn-results-close', {});
+}
+
+function reanalyze() {
+  eda.sys_MessageBus.publish('pdn-reanalyze', {});
+}
+
+// ============================================================
+// Main
+// ============================================================
+let useWebGL = false;
+
+function main() {
+  const glOk = initGL();
+  useWebGL = !!glOk;
+
+  eda.sys_MessageBus.subscribe('pdn-results-data', onMessageBusData);
+
+  if (!loadData()) {
+    eda.sys_MessageBus.publish('padne-results-ready', {});
+    setTimeout(() => {
+      if (!resultData && loadData()) startUI();
+    }, 1500);
+    return;
+  }
+  eda.sys_MessageBus.publish('padne-results-ready', {});
+  startUI();
+}
+
+function onMessageBusData(msg) {
+  if (resultData) return;
+  resultData = msg.result;
+  layerNames = msg.layerNames || {};
+  connectionPoints = msg.connectionPoints || {};
+  layerBoundaries = msg.layerBoundaries || {};
+  pcbContext = msg.pcbContext || null;
+  images = msg.images || null;
+  const warning = msg.warningMessage;
+  if (warning) {
+    const banner = document.getElementById('warning-banner');
+    if (banner) { banner.textContent = warning; banner.style.display = 'block'; }
+  }
+  if (!resultData || !resultData.layerSolutions) return;
+
+  layerNamesList = resultData.layerSolutions.map((ls, i) => ls.layerName || layerNames[i] || ('Layer ' + i));
+  layerVisible = layerNamesList.map(() => true);
+  let bx0=Infinity,bx1=-Infinity,by0=Infinity,by1=-Infinity;
+  for (const ls of resultData.layerSolutions) for (const m of ls.meshes) for (const v of m.vertices) {
+    const x=vx(v),y=vy(v);
+    if(x<bx0)bx0=x;if(x>bx1)bx1=x;if(y<by0)by0=y;if(y>by1)by1=y;
+  }
+  if(bx0!==Infinity) bounds={minX:bx0,maxX:bx1,minY:by0,maxY:by1};
+  // Expand bounds with PCB context
+  if (pcbContext) {
+    for (const s of (pcbContext.boardOutline || [])) {
+      if (s.x1<bounds.minX)bounds.minX=s.x1;if(s.x1>bounds.maxX)bounds.maxX=s.x1;
+      if (s.y1<bounds.minY)bounds.minY=s.y1;if(s.y1>bounds.maxY)bounds.maxY=s.y1;
+      if (s.x2<bounds.minX)bounds.minX=s.x2;if(s.x2>bounds.maxX)bounds.maxX=s.x2;
+      if (s.y2<bounds.minY)bounds.minY=s.y2;if(s.y2>bounds.maxY)bounds.maxY=s.y2;
+    }
+    for (const c of (pcbContext.components || [])) {
+      if (c.x<bounds.minX)bounds.minX=c.x;if(c.x>bounds.maxX)bounds.maxX=c.x;
+      if (c.y<bounds.minY)bounds.minY=c.y;if(c.y>bounds.maxY)bounds.maxY=c.y;
+    }
+  }
+  if (useWebGL) {
+    buildAllLayerBuffers();
+  }
+  resetView();
+  startUI();
+}
+
+function startUI() {
+  document.getElementById('loading').style.display = 'none';
+
+  const hasMeshData = resultData?.layerSolutions?.some(ls => ls.meshes?.length > 0 && ls.meshes.some(m => m.vertices?.length > 0));
+
+  if (!hasMeshData) {
+    const wrap = document.querySelector('.canvas-wrap');
+    wrap.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#8b949e;font-size:14px">无有效分析结果</div>';
+    document.getElementById('colorbar').style.display = 'none';
+    document.getElementById('info-panel').style.display = 'none';
+    return;
+  }
+
+  // WebGL 渲染
+  if (useWebGL && layerGL[currentLayerIdx] && layerGL[currentLayerIdx].meshVBO) {
+    setupUI();
+    setupInteraction();
+    drawColorbar();
+    render();
+  } else {
+    showImageFallback();
+  }
+}
+
+function showImageFallback() {
+  const toolbar = document.getElementById('toolbar');
+  toolbar.innerHTML = '<span style="padding:0 12px;color:#8b949e">WebGL 不可用，使用图片模式</span><span class="spacer"></span><button class="btn-close" onclick="closeWindow()">关闭</button>';
+
+  const wrap = document.querySelector('.canvas-wrap');
+  document.getElementById('colorbar').style.display = 'none';
+  document.getElementById('info-panel').style.display = 'none';
+
+  if (!images) {
+    wrap.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#484f58">无可视化数据</div>';
+    return;
+  }
+
+  const layerImgs = images.layers || {};
+  const layerKeys = Object.keys(layerImgs).sort();
+  let tabs = '';
+  if (images.view_3d) tabs += '<button class="view-tab active" data-view="3d">3D 视图</button>';
+  for (const k of layerKeys) tabs += '<button class="view-tab" data-view="' + k + '">' + k + '</button>';
+
+  wrap.innerHTML =
+    '<div class="view-tabs" style="display:flex;gap:2px;padding:4px 8px;background:#f5f5f5;border-bottom:1px solid #ddd">' + tabs + '</div>' +
+    '<div id="img-area" style="flex:1;display:flex;align-items:center;justify-content:center;background:#fff;padding:8px"></div>';
+
+  let currentView = images.view_3d ? '3d' : (layerKeys[0] || null);
+  showImg(currentView);
+
+  wrap.querySelectorAll('.view-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      wrap.querySelectorAll('.view-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      showImg(btn.dataset.view);
+    });
+  });
+
+  function showImg(view) {
+    const area = document.getElementById('img-area');
+    let b64 = null;
+    if (view === '3d') b64 = images.view_3d;
+    else b64 = layerImgs[view];
+    if (!b64) { area.innerHTML = '<div style="color:#999">该视图无数据</div>'; return; }
+    area.innerHTML = '<img src="data:image/png;base64,' + b64 + '" style="max-width:100%;max-height:100%;object-fit:contain">';
+  }
+}
+
+main();
+</script>
+
+<div id="diag-overlay" class="diag-overlay" style="display:none">
+  <div class="diag-modal">
+    <div class="diag-header">
+      <h3>诊断日志</h3>
+      <button onclick="document.getElementById('diag-overlay').style.display='none'">关闭</button>
+    </div>
+    <div class="diag-body" id="diag-content">无诊断信息</div>
+  </div>
+</div>
+
+<script>
+(function() {
+  function showDiag() {
+    const overlay = document.getElementById('diag-overlay');
+    const body = document.getElementById('diag-content');
+    const diags = resultData && resultData.diagnostics ? resultData.diagnostics : [];
+    if (diags.length === 0) {
+      body.textContent = '无诊断日志数据';
+    } else {
+      body.innerHTML = diags.map(line => {
+        if (line.startsWith('===')) return '<span class="diag-section">' + escHtml(line) + '</span>';
+        if (line.includes('⚠') || line.includes('!!') || line.includes('失败')) return '<span class="diag-bad">' + escHtml(line) + '</span>';
+        return escHtml(line);
+      }).join('\n');
+    }
+    overlay.style.display = '';
+  }
+  function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  document.getElementById('btn-diag').addEventListener('click', showDiag);
+})();
+</script>
+</body>
+</html>

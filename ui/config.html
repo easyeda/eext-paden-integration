@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>PDN 分析配置</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; background: #f0f0f0; color: #222; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  .left { width: 200px; min-width: 160px; border-right: 1px solid #bbb; display: flex; flex-direction: column; background: #fff; }
+  .left-title { padding: 6px 8px; font-size: 11px; font-weight: 600; color: #555; background: #f5f5f5; border-bottom: 1px solid #ddd; }
+  .net-list { flex: 1; overflow-y: auto; }
+  .net-item { padding: 5px 10px; cursor: pointer; font-size: 12px; border-bottom: 1px solid #f0f0f0; }
+  .net-item:hover { background: #e8f0fe; }
+  .net-item.selected { background: #1a73e8; color: #fff; }
+
+  .right { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #fff; }
+  .rail-header { padding: 8px 12px; background: #f5f5f5; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 12px; }
+  .rail-header label { font-size: 12px; color: #555; }
+  .rail-header input { width: 80px; padding: 3px 6px; border: 1px solid #bbb; border-radius: 3px; font-size: 12px; }
+  .table-wrap { flex: 1; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: #f5f5f5; padding: 5px 10px; text-align: left; border-bottom: 2px solid #ddd; font-weight: 600; color: #555; position: sticky; top: 0; }
+  td { padding: 5px 10px; border-bottom: 1px solid #f0f0f0; }
+  tr.selected-row td { background: #e8f0fe; }
+  tr:hover td { background: #f5f5f5; }
+  tr.selected-row:hover td { background: #d2e3fc; }
+  .role-source { color: #c0392b; font-weight: 600; }
+  .role-load { color: #2980b9; font-weight: 600; }
+  .table-actions { padding: 6px 10px; border-top: 1px solid #ddd; display: flex; gap: 6px; background: #f9f9f9; }
+  .btn-action { padding: 4px 12px; font-size: 12px; border: 1px solid #bbb; border-radius: 3px; cursor: pointer; background: #fff; }
+  .btn-action:hover { background: #e8e8e8; }
+  .btn-action:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-remove { color: #c0392b; border-color: #e0a0a0; }
+  .btn-remove:hover:not(:disabled) { background: #fdecea; }
+
+  .bottom { padding: 8px 12px; border-top: 1px solid #bbb; background: #f0f0f0; display: flex; align-items: center; gap: 16px; }
+  .bottom label { font-size: 12px; color: #555; }
+  .bottom input[type=number] { width: 60px; padding: 3px 6px; border: 1px solid #bbb; border-radius: 3px; font-size: 12px; }
+  .bottom-right { margin-left: auto; display: flex; gap: 8px; }
+  .btn-main { padding: 5px 16px; font-size: 13px; border-radius: 3px; border: 1px solid #bbb; cursor: pointer; }
+  .btn-run { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+  .btn-run:hover:not(:disabled) { background: #1557b0; }
+  .btn-run:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-close { background: #fff; }
+  .btn-close:hover { background: #e8e8e8; }
+
+  .overlay { display: none; position: fixed; inset: 0; background: transparent; z-index: 100; align-items: center; justify-content: center; pointer-events: none; }
+  .overlay.show { display: flex; }
+  .overlay-box { background: #fff; border-radius: 6px; padding: 18px; min-width: 460px; max-width: 580px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); pointer-events: auto; }
+  .overlay-box h3 { font-size: 14px; margin-bottom: 10px; }
+  .overlay-box select { width: 100%; padding: 5px; border: 1px solid #bbb; border-radius: 3px; font-size: 13px; margin-bottom: 8px; }
+  .overlay-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+  .overlay-btns button { padding: 5px 16px; font-size: 12px; border: 1px solid #bbb; border-radius: 3px; cursor: pointer; background: #fff; }
+  .overlay-btns .btn-ok { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+  .overlay-btns .btn-ok:hover { background: #1557b0; }
+  .current-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 12px; }
+  .current-row input { width: 70px; padding: 3px 6px; border: 1px solid #bbb; border-radius: 3px; }
+
+  .empty-hint { padding: 20px; text-align: center; color: #999; font-size: 12px; }
+
+  .error-banner { display: none; padding: 8px 12px; background: #fdecea; color: #c0392b; font-size: 12px; line-height: 1.5; border-bottom: 1px solid #e0a0a0; cursor: pointer; }
+  .error-banner.show { display: block; }
+  .error-banner:hover { background: #f8d0d0; }
+</style>
+</head>
+<body>
+
+<div class="error-banner" id="error-banner" onclick="this.classList.remove('show')"></div>
+
+<div class="main">
+  <div class="left">
+    <div class="left-title">电源网络</div>
+    <input type="text" id="net-search" placeholder="搜索网络..." style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;margin-bottom:6px;box-sizing:border-box" oninput="renderNetList()">
+    <div class="net-list" id="net-list"></div>
+  </div>
+  <div class="right">
+    <div class="rail-header">
+      <span style="font-weight:600;font-size:13px">轨道属性</span>
+      <label>电压 (V):</label>
+      <input type="number" id="rail-voltage" value="3.3" step="0.1" min="0" onchange="updateVoltage()">
+    </div>
+    <div class="table-wrap">
+      <table id="rail-table">
+        <thead><tr><th>角色</th><th>位号</th><th>参数</th><th>焊盘数</th></tr></thead>
+        <tbody id="rail-tbody"></tbody>
+      </table>
+      <div class="empty-hint" id="empty-hint">请先在左侧选择一个电源网络</div>
+    </div>
+    <div class="table-actions">
+      <button class="btn-action" onclick="addSource()" id="btn-add-source" disabled>+ 电压源</button>
+      <button class="btn-action" onclick="addLoad()" id="btn-add-load" disabled>+ 负载</button>
+      <button class="btn-action btn-remove" onclick="removeSelected()" id="btn-remove" disabled>- 移除</button>
+    </div>
+  </div>
+</div>
+
+<div class="bottom">
+  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <label>铜厚 (mm):</label>
+    <input type="number" id="cu-thickness" value="0.035" min="0.005" max="0.21" step="0.005" style="width:60px">
+  </div>
+  <div class="bottom-right">
+    <button class="btn-main btn-run" id="btn-run" onclick="runAnalysis()" disabled>开始分析</button>
+    <button class="btn-main btn-close" onclick="cancel()">取消</button>
+  </div>
+</div>
+
+<!-- 器件选择弹窗 -->
+<div class="overlay" id="picker-overlay">
+  <div class="overlay-box">
+    <h3 id="picker-title">选择器件</h3>
+    <input type="text" id="picker-search" placeholder="搜索位号或器件名..." style="width:100%;padding:7px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;margin-bottom:8px;box-sizing:border-box" oninput="filterPicker()">
+    <select id="picker-select" size="10" style="width:100%;height:260px"></select>
+    <div class="current-row" id="picker-current-row" style="display:none">
+      <label>电流 (A):</label>
+      <input type="number" id="picker-current" value="1.0" min="0.001" step="0.1">
+    </div>
+    <div class="overlay-btns">
+      <button onclick="closePicker()">取消</button>
+      <button class="btn-ok" onclick="confirmPicker()">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 提示弹窗 -->
+<div class="overlay" id="hint-overlay">
+  <div class="overlay-box">
+    <h3>提示</h3>
+    <p id="hint-text" style="font-size:13px;line-height:1.6;margin:8px 0"></p>
+    <div class="overlay-btns">
+      <button class="btn-ok" onclick="closeHint()">确定</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── 状态 ──
+  let padsByNet = {};       // Record<string, Pad[]>
+  let layerNames = {};      // Record<number, string>
+  let allNetNames = [];     // string[]
+  let selectedNetIdx = -1;
+  let selectedRowIdx = -1;
+  let pickerMode = '';
+
+  // Pad: { net, x, y, pad_number, width, height, layer?, ref_des?, device_name? }
+  // 每条轨道的配置
+  const railConfig = {};    // Record<string, { voltage, rows: [{role, ref_des, pads, current}] }>
+
+  // ── MessageBus ──
+  eda.sys_MessageBus.subscribe('pdn-config-data', (msg) => {
+    padsByNet = msg.padsByNet || {};
+    layerNames = msg.layerNames || {};
+    allNetNames = Object.keys(padsByNet).sort((a, b) => a.localeCompare(b));
+    const banner = document.getElementById('error-banner');
+    if (msg.lastError) {
+      banner.textContent = msg.lastError;
+      banner.classList.add('show');
+    } else {
+      banner.classList.remove('show');
+    }
+    initRailConfig();
+    renderNetList();
+    if (allNetNames.length > 0) selectNet(0);
+  });
+  eda.sys_MessageBus.publish('pdn-config-ready', {});
+
+  // ── 初始化 ──
+  function initRailConfig() {
+    for (const net of allNetNames) {
+      if (!railConfig[net]) {
+        railConfig[net] = { voltage: guessVoltage(net), rows: [] };
+      }
+    }
+  }
+
+  function guessVoltage(name) {
+    const n = name.toUpperCase();
+    const mVx = n.match(/(\d+)V(\d+)/);
+    if (mVx) return parseFloat(mVx[1] + '.' + mVx[2]);
+    const mDot = n.match(/(\d+\.\d+)V/);
+    if (mDot) return parseFloat(mDot[1]);
+    const mInt = n.match(/(\d+)V/);
+    if (mInt) return parseFloat(mInt[1]);
+    if (n.includes('GND') || n.includes('GND')) return 0;
+    return 3.3;
+  }
+
+  // ── 网络列表 ──
+  function renderNetList() {
+    const el = document.getElementById('net-list');
+    if (!allNetNames.length) {
+      el.innerHTML = '<div class="empty-hint">未检测到网络</div>';
+      return;
+    }
+    const q = (document.getElementById('net-search')?.value || '').toLowerCase();
+    const filtered = allNetNames
+      .map((net, i) => ({ net, i }))
+      .filter(({ net }) => !q || net.toLowerCase().includes(q));
+    if (!filtered.length) {
+      el.innerHTML = '<div class="empty-hint">无匹配网络</div>';
+      return;
+    }
+    el.innerHTML = filtered.map(({ net, i }) => {
+      const cfg = railConfig[net];
+      const padCount = (padsByNet[net] || []).length;
+      const srcCount = cfg.rows.filter(r => r.role === 'SOURCE').length;
+      const loadCount = cfg.rows.filter(r => r.role === 'LOAD').length;
+      const badge = srcCount > 0 || loadCount > 0 ? ` [${srcCount}S/${loadCount}L]` : '';
+      return `<div class="net-item${i === selectedNetIdx ? ' selected' : ''}" onclick="selectNet(${i})">${net} (${padCount}p)${badge}</div>`;
+    }).join('');
+  }
+
+  function selectNet(idx) {
+    selectedNetIdx = idx;
+    selectedRowIdx = -1;
+    renderNetList();
+    renderRailTable();
+    updateActionButtons();
+  }
+
+  // ── 轨道表格 ──
+  function renderRailTable() {
+    const hint = document.getElementById('empty-hint');
+    const table = document.getElementById('rail-table');
+    if (selectedNetIdx < 0) { hint.style.display = 'block'; table.style.display = 'none'; return; }
+    hint.style.display = 'none';
+    table.style.display = 'table';
+
+    const net = allNetNames[selectedNetIdx];
+    const cfg = railConfig[net];
+    document.getElementById('rail-voltage').value = cfg.voltage;
+
+    const tbody = document.getElementById('rail-tbody');
+    tbody.innerHTML = cfg.rows.map((row, i) => {
+      const roleClass = row.role === 'SOURCE' ? 'role-source' : 'role-load';
+      const valueCell = row.role === 'LOAD' ? `${row.current}A` : `${cfg.voltage}V`;
+      return `<tr class="${i === selectedRowIdx ? 'selected-row' : ''}" onclick="selectRow(${i})">
+        <td class="${roleClass}">${row.role === 'SOURCE' ? '电压源' : '负载'}</td>
+        <td>${row.ref_des}</td>
+        <td>${valueCell}</td>
+        <td>${row.pads.length}</td>
+      </tr>`;
+    }).join('');
+    updateRunButton();
+  }
+
+  function selectRow(idx) {
+    selectedRowIdx = idx;
+    renderRailTable();
+    updateActionButtons();
+  }
+
+  function updateVoltage() {
+    if (selectedNetIdx < 0) return;
+    const net = allNetNames[selectedNetIdx];
+    railConfig[net].voltage = parseFloat(document.getElementById('rail-voltage').value) || 0;
+    renderNetList();
+  }
+
+  function updateActionButtons() {
+    const hasNet = selectedNetIdx >= 0;
+    const hasRow = selectedRowIdx >= 0;
+    document.getElementById('btn-add-source').disabled = !hasNet;
+    document.getElementById('btn-add-load').disabled = !hasNet;
+    document.getElementById('btn-remove').disabled = !hasNet || !hasRow;
+  }
+
+  function updateRunButton() {
+    const hasAnySource = Object.values(railConfig).some(cfg =>
+      cfg.rows.some(r => r.role === 'SOURCE')
+    );
+    document.getElementById('btn-run').disabled = !hasAnySource;
+  }
+
+  // ── 添加电压源/负载 ──
+  function addSource() { openPicker('source'); }
+  function addLoad() { openPicker('load'); }
+
+  let pickerPads = [];
+
+  function openPicker(mode) {
+    if (selectedNetIdx < 0) return;
+    pickerMode = mode;
+    const net = allNetNames[selectedNetIdx];
+    const cfg = railConfig[net];
+    const usedRefs = new Set(cfg.rows.map(r => r.ref_des));
+
+    // 按位号分组该网络的焊盘
+    const pads = padsByNet[net] || [];
+    const byRef = {};
+    for (const p of pads) {
+      const ref = p.ref_des || `Pad_${p.pad_number}`;
+      if (!byRef[ref]) byRef[ref] = [];
+      byRef[ref].push(p);
+    }
+    pickerPads = Object.entries(byRef).filter(([ref]) => !usedRefs.has(ref)).sort((a, b) => a[0].localeCompare(b[0]));
+
+    if (!pickerPads.length) {
+      eda.sys_Message.showToastMessage('该网络所有器件已添加');
+      return;
+    }
+
+    document.getElementById('picker-search').value = '';
+    document.getElementById('picker-title').textContent = mode === 'source' ? '选择电压源器件' : '选择负载器件';
+    document.getElementById('picker-current-row').style.display = mode === 'load' ? 'flex' : 'none';
+    renderPickerOptions(pickerPads);
+    document.getElementById('picker-overlay').classList.add('show');
+  }
+
+  function renderPickerOptions(items) {
+    const select = document.getElementById('picker-select');
+    select.innerHTML = items.map(([ref, pads]) => {
+      const dev = pads[0].device_name ? ` (${pads[0].device_name})` : '';
+      return `<option value="${ref}">${ref}${dev} (${pads.length}p)</option>`;
+    }).join('');
+  }
+
+  function filterPicker() {
+    const q = document.getElementById('picker-search').value.toLowerCase();
+    const filtered = q
+      ? pickerPads.filter(([ref, pads]) => ref.toLowerCase().includes(q) || (pads[0]?.device_name || '').toLowerCase().includes(q))
+      : pickerPads;
+    renderPickerOptions(filtered);
+  }
+
+  function closePicker() {
+    document.getElementById('picker-overlay').classList.remove('show');
+  }
+
+  function confirmPicker() {
+    const refDes = document.getElementById('picker-select').value;
+    if (!refDes) return;
+
+    const net = allNetNames[selectedNetIdx];
+    const cfg = railConfig[net];
+    const entry = pickerPads.find(([ref]) => ref === refDes);
+    if (!entry) return;
+
+    const [, pads] = entry;
+    // 转换焊盘为配置格式
+    const padConfigs = pads.map(p => ({
+      x: p.x, y: p.y,
+      layer: p.layer != null ? (layerNames[p.layer] || `Layer_${p.layer}`) : ''
+    }));
+
+    if (pickerMode === 'source') {
+      cfg.rows.push({ role: 'SOURCE', ref_des: refDes, pads: padConfigs, current: 0 });
+    } else {
+      const current = parseFloat(document.getElementById('picker-current').value) || 1.0;
+      cfg.rows.push({ role: 'LOAD', ref_des: refDes, pads: padConfigs, current });
+    }
+
+    closePicker();
+    renderRailTable();
+    updateActionButtons();
+    renderNetList();
+  }
+
+  function removeSelected() {
+    if (selectedNetIdx < 0 || selectedRowIdx < 0) return;
+    const net = allNetNames[selectedNetIdx];
+    railConfig[net].rows.splice(selectedRowIdx, 1);
+    selectedRowIdx = -1;
+    renderRailTable();
+    updateActionButtons();
+    renderNetList();
+  }
+
+  // ── 开始分析 / 取消 ──
+  function runAnalysis() {
+    const rails = [];
+    let hasSource = false;
+    let hasLoad = false;
+    for (const net of allNetNames) {
+      const cfg = railConfig[net];
+      if (!cfg.rows.length) continue;
+      const sources = cfg.rows.filter(r => r.role === 'SOURCE').map(r => ({
+        ref_des: r.ref_des, pads: r.pads
+      }));
+      const loads = cfg.rows.filter(r => r.role === 'LOAD').map(r => ({
+        ref_des: r.ref_des, current: r.current, pads: r.pads
+      }));
+      if (sources.length > 0 || loads.length > 0) {
+        rails.push({ net, voltage: cfg.voltage, sources, loads });
+        if (sources.length > 0) hasSource = true;
+        if (loads.length > 0) hasLoad = true;
+      }
+    }
+
+    if (rails.length === 0) {
+      showHint('请至少为一个电源网络添加电压源或负载');
+      return;
+    }
+    if (!hasSource) {
+      showHint('请至少添加一个电压源作为参考电位');
+      return;
+    }
+    if (!hasLoad) {
+      showHint('请至少添加一个负载，否则无电流回路');
+      return;
+    }
+
+    for (const rail of rails) {
+      if (rail.voltage <= 0) {
+        showHint(`网络 "${rail.net}" 的电压不能为 0 或负数，请检查`);
+        return;
+      }
+      for (const load of rail.loads) {
+        if (!load.current || load.current <= 0) {
+          showHint(`网络 "${rail.net}" 中负载 "${load.ref_des}" 的电流不能为 0 或负数`);
+          return;
+        }
+      }
+      for (const src of rail.sources) {
+        if (!src.pads.length) {
+          showHint(`网络 "${rail.net}" 中电压源 "${src.ref_des}" 没有焊盘数据`);
+          return;
+        }
+      }
+      for (const load of rail.loads) {
+        if (!load.pads.length) {
+          showHint(`网络 "${rail.net}" 中负载 "${load.ref_des}" 没有焊盘数据`);
+          return;
+        }
+      }
+    }
+
+    const cuThickness = parseFloat(document.getElementById('cu-thickness').value) || 0.035;
+    const layerIds = Object.keys(layerNames).map(Number);
+    const layerCuThickness = {};
+    for (const lid of layerIds) layerCuThickness[lid] = cuThickness;
+
+    eda.sys_MessageBus.publish('pdn-config-result', {
+      config: { rails, layerCuThickness }
+    });
+  }
+
+  function showHint(msg) {
+    const el = document.getElementById('hint-overlay');
+    document.getElementById('hint-text').textContent = msg;
+    el.classList.add('show');
+  }
+
+  function closeHint() {
+    document.getElementById('hint-overlay').classList.remove('show');
+  }
+
+  function cancel() {
+    eda.sys_MessageBus.publish('pdn-config-cancel', {});
+  }
+</script>
+</body>
+</html>
