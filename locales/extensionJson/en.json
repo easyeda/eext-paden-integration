@@ -1,3 +1,8 @@
 {
-	"About...": "About..."
+	"About...": "About...",
+	"PADEN仿真": "PADEN Simulation",
+	"从 EasyEDA 提取 PCB 数据并进行 PADEN 电源分配网络分析": "Extract PCB data from EasyEDA and perform PADEN power distribution network analysis",
+	"PDN": "PDN",
+	"Power Analysis": "Power Analysis",
+	"Simulation": "Simulation"
 }
